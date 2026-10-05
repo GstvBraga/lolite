@@ -19,6 +19,15 @@ struct Shared {
     /// (id, name, group)
     queues: Vec<(i64, String, &'static str)>,
     champs: Vec<(i64, String)>,
+    /// (id, name, game modes it's allowed in)
+    spells: Vec<(i64, String, Vec<String>)>,
+    queue_modes: HashMap<i64, String>,
+    queue_maps: HashMap<i64, i64>,
+    /// (id, name, valid)
+    rune_pages: Vec<(i64, String, bool)>,
+    rune_current: i64,
+    /// Riot's recommended pages for my champ/role: (label, page body)
+    recommended: Vec<(String, Value)>,
     lobby: Value,
     search: Value,
     ready: Value,
@@ -71,10 +80,10 @@ fn queue_group(q: &Value) -> &'static str {
 }
 
 fn load_static(api: &Api, s: &S) {
-    let mut queues: Vec<(i64, String, &'static str)> = api
-        .get("/lol-game-queues/v1/queues")
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
+    let all_queues = api.get("/lol-game-queues/v1/queues").and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    let queue_modes = all_queues.iter().filter_map(|q| Some((q["id"].as_i64()?, q["gameMode"].as_str()?.to_string()))).collect();
+    let queue_maps = all_queues.iter().filter_map(|q| Some((q["id"].as_i64()?, q["mapId"].as_i64()?))).collect();
+    let mut queues: Vec<(i64, String, &'static str)> = all_queues
         .iter()
         .filter(|q| {
             q["queueAvailability"] == "Available"
@@ -101,6 +110,18 @@ fn load_static(api: &Api, s: &S) {
         .collect();
     champs.sort_by(|a, b| a.1.cmp(&b.1));
 
+    let mut spells: Vec<(i64, String, Vec<String>)> = api
+        .get("/lol-game-data/assets/v1/summoner-spells.json")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|sp| {
+            let modes: Vec<String> = sp["gameModes"].as_array()?.iter().filter_map(|m| m.as_str().map(String::from)).collect();
+            Some((sp["id"].as_i64()?, sp["name"].as_str().filter(|n| !n.is_empty())?.to_string(), modes))
+        })
+        .collect();
+    spells.sort_by(|a, b| a.1.cmp(&b.1));
+
     let summoner = api
         .get("/lol-summoner/v1/current-summoner")
         .map(|v| format!("{}#{}", v["gameName"].as_str().unwrap_or("?"), v["tagLine"].as_str().unwrap_or("")))
@@ -109,6 +130,9 @@ fn load_static(api: &Api, s: &S) {
     let mut g = s.lock().unwrap();
     g.queues = queues;
     g.champs = champs;
+    g.spells = spells;
+    g.queue_modes = queue_modes;
+    g.queue_maps = queue_maps;
     g.summoner = summoner;
 }
 
@@ -141,8 +165,10 @@ fn poller(s: S, ctx: egui::Context) {
     let mut launched_at: Option<Instant> = None;
     let mut last_kill_ux: Option<Instant> = None;
     let mut last_phase = String::new();
-    let mut last_invites = 0;
+    let mut last_pending = 0;
     let mut names: HashMap<String, String> = HashMap::new();
+    let mut rec_key = String::new();
+    let mut recommended: Vec<(String, Value)> = vec![];
 
     loop {
         let (auto_launch, auto_accept, want_ux, need_static) = {
@@ -187,6 +213,27 @@ fn poller(s: S, ctx: egui::Context) {
                 let champ = phase == "ChampSelect";
                 let session = if champ { api.get("/lol-champ-select/v1/session") } else { None };
                 let pickable = if champ { ids(api.get("/lol-champ-select/v1/pickable-champion-ids")) } else { vec![] };
+                let rune_pages: Vec<(i64, String, bool)> = if champ {
+                    api.get("/lol-perks/v1/pages")
+                        .and_then(|v| v.as_array().cloned())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|p| p["isEditable"] == true || p["isActive"] == true)
+                        .filter_map(|p| Some((p["id"].as_i64()?, p["name"].as_str()?.to_string(), p["isValid"] != false)))
+                        .collect()
+                } else {
+                    vec![]
+                };
+                if let Some(path) = session.as_ref().and_then(|sess| recommended_path(sess, &s)) {
+                    if path != rec_key {
+                        recommended = fetch_recommended(&api, &path);
+                        rec_key = path;
+                    }
+                } else {
+                    recommended.clear();
+                    rec_key.clear();
+                }
+                let rune_current = if champ { api.get("/lol-perks/v1/currentpage").and_then(|p| p["id"].as_i64()).unwrap_or(0) } else { 0 };
                 let mut invites: Vec<Value> = api
                     .get("/lol-lobby/v2/received-invitations")
                     .and_then(|v| v.as_array().cloned())
@@ -197,10 +244,12 @@ fn poller(s: S, ctx: egui::Context) {
                 for inv in &mut invites {
                     fill_name(&api, &mut names, inv, "fromSummonerName", "fromPuuid");
                 }
-                if invites.len() > last_invites {
+                // Flash the taskbar for new invites or incoming role-swap requests.
+                let pending = invites.len() + session.as_ref().map_or(0, received_swaps);
+                if pending > last_pending {
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
                 }
-                last_invites = invites.len();
+                last_pending = pending;
 
                 let mut g = s.lock().unwrap();
                 g.status = "Connected".into();
@@ -212,6 +261,9 @@ fn poller(s: S, ctx: egui::Context) {
                 g.ready = ready.unwrap_or(Value::Null);
                 g.session = session.unwrap_or(Value::Null);
                 g.pickable = pickable;
+                g.rune_pages = rune_pages;
+                g.rune_current = rune_current;
+                g.recommended = recommended.clone();
                 g.invites = invites;
                 last_phase = phase;
             }
@@ -340,6 +392,174 @@ fn champ_options(g: &Shared, t: &Turn, search: &str) -> Vec<(i64, String)> {
     let q = search.to_lowercase();
     out.extend(g.champs.iter().filter(|c| allowed(c.0) && c.1.to_lowercase().contains(&q)).cloned());
     out
+}
+
+/// Role-swap buttons for a teammate's cell (draft/ranked only; state is AVAILABLE/BUSY/INVALID/RECEIVED/SENT).
+fn swap_buttons(ui: &mut egui::Ui, s: &S, g: &Shared, cell: Option<i64>) {
+    let Some(swap) = g.session["positionSwaps"].as_array().into_iter().flatten().find(|w| w["cellId"].as_i64() == cell) else {
+        return;
+    };
+    let id = swap["id"].as_i64().unwrap_or(0);
+    let send = |verb: &str| act(s, "POST", format!("/lol-champ-select/v1/session/position-swaps/{id}/{verb}"), None);
+    match swap["state"].as_str().unwrap_or("") {
+        "AVAILABLE" => {
+            if ui.small_button("Swap role").clicked() {
+                send("request");
+            }
+        }
+        "SENT" => {
+            ui.weak("swap sent");
+            if ui.small_button("Cancel").clicked() {
+                send("cancel");
+            }
+        }
+        "RECEIVED" => {
+            let accept = egui::Button::new(egui::RichText::new("Accept swap").strong().color(egui::Color32::BLACK)).fill(egui::Color32::from_rgb(0x0A, 0xC8, 0xB9));
+            if ui.add(accept).clicked() {
+                send("accept");
+            }
+            if ui.small_button("Decline").clicked() {
+                send("decline");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn received_swaps(session: &Value) -> usize {
+    session["positionSwaps"].as_array().map_or(0, |a| a.iter().filter(|w| w["state"] == "RECEIVED").count())
+}
+
+/// (position, champion) for each enemy; champions show once revealed.
+fn enemy_team(g: &Shared) -> Vec<(String, String)> {
+    g.session["theirTeam"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let id = p["championId"].as_i64().unwrap_or(0);
+            (p["assignedPosition"].as_str().unwrap_or("").to_string(), if id == 0 { "—".into() } else { champ_name(g, id) })
+        })
+        .collect()
+}
+
+/// Comma-separated ban names for "myTeamBans" or "theirTeamBans".
+fn bans(g: &Shared, key: &str) -> String {
+    let names: Vec<String> = ids(Some(g.session["bans"][key].clone())).into_iter().filter(|id| *id > 0).map(|id| champ_name(g, id)).collect();
+    if names.is_empty() { "—".into() } else { names.join(", ") }
+}
+
+/// Summoner spells + rune page pickers for champ select; shared by both layouts.
+fn loadout(ui: &mut egui::Ui, s: &S, g: &Shared) {
+    let sess = &g.session;
+    let me = sess["myTeam"].as_array().into_iter().flatten().find(|p| p["cellId"] == sess["localPlayerCellId"]);
+    let (d, f) = me.map_or((0, 0), |p| (p["spell1Id"].as_i64().unwrap_or(0), p["spell2Id"].as_i64().unwrap_or(0)));
+    let mode = g.queue_modes.get(&sess["queueId"].as_i64().unwrap_or(0)).cloned().unwrap_or_default();
+    let spells: Vec<&(i64, String, Vec<String>)> = g.spells.iter().filter(|sp| sp.2.contains(&mode)).collect();
+    let spell_name = |id: i64| g.spells.iter().find(|sp| sp.0 == id).map_or("—".to_string(), |sp| sp.1.clone());
+
+    if !spells.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label("Spells");
+            let (mut nd, mut nf) = (d, f);
+            for (salt, val) in [("spell_d", &mut nd), ("spell_f", &mut nf)] {
+                egui::ComboBox::from_id_salt(salt).width(110.0).selected_text(spell_name(*val)).show_ui(ui, |ui| {
+                    for sp in &spells {
+                        ui.selectable_value(val, sp.0, &sp.1);
+                    }
+                });
+            }
+            // Picking the spell already in the other slot swaps them, like the official client.
+            if nd != d && nd == f {
+                nf = d;
+            } else if nf != f && nf == d {
+                nd = f;
+            }
+            if (nd, nf) != (d, f) {
+                act(s, "PATCH", "/lol-champ-select/v1/session/my-selection".into(), Some(json!({ "spell1Id": nd, "spell2Id": nf })));
+            }
+        });
+    }
+
+    if !g.rune_pages.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label("Runes");
+            let current = g.rune_pages.iter().find(|p| p.0 == g.rune_current).map_or("—".to_string(), |p| p.1.clone());
+            let mut pick = g.rune_current;
+            egui::ComboBox::from_id_salt("runes").width(200.0).selected_text(current).show_ui(ui, |ui| {
+                for (id, name, valid) in &g.rune_pages {
+                    let label = if *valid { name.clone() } else { format!("{name} (incomplete)") };
+                    ui.selectable_value(&mut pick, *id, label);
+                }
+            });
+            if pick != g.rune_current {
+                act(s, "PUT", "/lol-perks/v1/currentpage".into(), Some(json!(pick)));
+            }
+        });
+    }
+
+    if !g.recommended.is_empty() {
+        ui.label("Recommended runes (saved to a \"LoLite\" page, or overwrites the current page if all pages are used):");
+        for (label, page) in &g.recommended {
+            ui.horizontal(|ui| {
+                if ui.small_button("Use").clicked() {
+                    use_runes(s, page.clone());
+                }
+                ui.label(label);
+            });
+        }
+    }
+}
+
+/// Recommended-pages path for my current champion, role and map; None until a champion is hovered.
+fn recommended_path(sess: &Value, s: &S) -> Option<String> {
+    let me = sess["myTeam"].as_array()?.iter().find(|p| p["cellId"] == sess["localPlayerCellId"])?;
+    let champ = [me["championId"].as_i64(), me["championPickIntent"].as_i64()].into_iter().flatten().find(|id| *id > 0)?;
+    let pos = me["assignedPosition"].as_str().filter(|p| !p.is_empty()).unwrap_or("none").to_lowercase();
+    let map = *s.lock().unwrap().queue_maps.get(&sess["queueId"].as_i64()?)?;
+    Some(format!("/lol-perks/v1/recommended-pages/champion/{champ}/position/{pos}/map/{map}"))
+}
+
+/// Label is the keystone and the three primary-tree runes.
+fn fetch_recommended(api: &Api, path: &str) -> Vec<(String, Value)> {
+    api.get(path)
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            let perks = r["perks"].as_array()?;
+            let names: Vec<&str> = perks.iter().take(4).filter_map(|p| p["name"].as_str()).collect();
+            let label = format!("{} — {}", names.first()?, names[1..].join(", "));
+            let ids: Vec<i64> = perks.iter().filter_map(|p| p["id"].as_i64()).collect();
+            Some((label, json!({ "primaryStyleId": r["primaryPerkStyleId"], "subStyleId": r["secondaryPerkStyleId"], "selectedPerkIds": ids })))
+        })
+        .collect()
+}
+
+/// Writes a recommended page into the "LoLite" page, a new page if there is room, or else the current page.
+fn use_runes(s: &S, mut page: Value) {
+    let s = s.clone();
+    std::thread::spawn(move || {
+        let Some(api) = s.lock().unwrap().lcu.clone() else { return };
+        let pages = api.get("/lol-perks/v1/pages").and_then(|v| v.as_array().cloned()).unwrap_or_default();
+        let current = api.get("/lol-perks/v1/currentpage");
+        let room = api.get("/lol-perks/v1/inventory").is_some_and(|i| i["canAddCustomPage"] == true);
+        let target = pages
+            .iter()
+            .find(|p| p["isEditable"] == true && p["name"] == "LoLite")
+            .or(if room { None } else { current.as_ref().filter(|p| p["isEditable"] == true) })
+            .and_then(|p| p["id"].as_i64());
+        page["name"] = json!("LoLite");
+        page["current"] = json!(true);
+        let res = match target {
+            Some(id) => {
+                page["id"] = json!(id);
+                api.send("PUT", &format!("/lol-perks/v1/pages/{id}"), Some(page)).and_then(|_| api.send("PUT", "/lol-perks/v1/currentpage", Some(json!(id))))
+            }
+            None => api.send("POST", "/lol-perks/v1/pages", Some(page)),
+        };
+        s.lock().unwrap().error = res.err().unwrap_or_default();
+    });
 }
 
 fn hover(s: &S, t: &Turn, id: i64) {
@@ -570,15 +790,25 @@ impl App {
         let mut first = me["firstPositionPreference"].as_str().unwrap_or("").to_string();
         let mut second = me["secondPositionPreference"].as_str().unwrap_or("").to_string();
         let (f0, s0) = (first.clone(), second.clone());
+        let shown = |r: &str| if r.is_empty() || r == "UNSELECTED" { "—".to_string() } else { r.to_string() };
         ui.horizontal(|ui| {
-            for (id, val) in [("r1", &mut first), ("r2", &mut second)] {
-                egui::ComboBox::from_id_salt(id).selected_text(val.as_str()).show_ui(ui, |ui| {
-                    for r in ROLES {
-                        ui.selectable_value(val, r.to_string(), *r);
+            egui::ComboBox::from_id_salt("r1").selected_text(shown(&first)).show_ui(ui, |ui| {
+                for r in ROLES {
+                    ui.selectable_value(&mut first, r.to_string(), *r);
+                }
+            });
+            // Riot rejects a secondary role when the primary is FILL (QPInvalidPositionSelectionRestriction).
+            if first != "FILL" {
+                egui::ComboBox::from_id_salt("r2").selected_text(shown(&second)).show_ui(ui, |ui| {
+                    for r in ROLES.iter().filter(|r| **r != first) {
+                        ui.selectable_value(&mut second, r.to_string(), *r);
                     }
                 });
             }
         });
+        if first == "FILL" || second == first {
+            second = "UNSELECTED".into();
+        }
         if first != f0 || second != s0 {
             act(
                 &self.s,
@@ -598,7 +828,21 @@ impl App {
         for p in sess["myTeam"].as_array().into_iter().flatten() {
             let id = p["championId"].as_i64().filter(|i| *i != 0).or(p["championPickIntent"].as_i64()).unwrap_or(0);
             let you = if p["cellId"].as_i64() == me { " (you)" } else { "" };
-            ui.label(format!("{:8} {}{you}", p["assignedPosition"].as_str().unwrap_or(""), champ_name(g, id)));
+            ui.horizontal(|ui| {
+                ui.label(format!("{:8} {}{you}", p["assignedPosition"].as_str().unwrap_or(""), champ_name(g, id)));
+                swap_buttons(ui, &self.s, g, p["cellId"].as_i64());
+            });
+        }
+        ui.separator();
+        loadout(ui, &self.s, g);
+        let enemies = enemy_team(g);
+        if !enemies.is_empty() {
+            ui.separator();
+            ui.label("Enemy team:");
+            for (pos, champ) in enemies {
+                ui.label(format!("{pos:8} {champ}"));
+            }
+            ui.label(format!("Bans — ours: {} | theirs: {}", bans(g, "myTeamBans"), bans(g, "theirTeamBans")));
         }
         ui.separator();
 

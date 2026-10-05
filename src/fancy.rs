@@ -335,9 +335,32 @@ impl App {
                     }
                     ui.label(RichText::new(name).color(if you { GOLD } else { TEXT }).strong());
                     ui.label(RichText::new(champ_name(g, id)).color(MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| swap_buttons(ui, &self.s, g, p["cellId"].as_i64()));
                 });
             }
         });
+
+        card(ui, "LOADOUT", GOLD, |ui| {
+            loadout(ui, &self.s, g);
+            ui.label(RichText::new("Edit rune pages via \"Full client\" in the header.").size(11.0).color(MUTED));
+        });
+
+        let enemies = enemy_team(g);
+        if !enemies.is_empty() {
+            card(ui, "ENEMY TEAM", RED, |ui| {
+                for (pos, champ) in enemies {
+                    ui.horizontal(|ui| {
+                        if !pos.is_empty() {
+                            ui.label(RichText::new(pos).size(11.0).color(MUTED));
+                        }
+                        ui.label(RichText::new(champ).strong());
+                    });
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("Our bans: {}", bans(g, "myTeamBans"))).size(12.0).color(MUTED));
+                ui.label(RichText::new(format!("Their bans: {}", bans(g, "theirTeamBans"))).size(12.0).color(MUTED));
+            });
+        }
 
         let t = match my_turn(g) {
             Ok(t) => t,
