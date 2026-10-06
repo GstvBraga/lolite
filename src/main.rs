@@ -394,16 +394,22 @@ fn champ_options(g: &Shared, t: &Turn, search: &str) -> Vec<(i64, String)> {
     out
 }
 
-/// Role-swap buttons for a teammate's cell (draft/ranked only; state is AVAILABLE/BUSY/INVALID/RECEIVED/SENT).
+/// Role-swap (draft/ranked) and champion-trade (ARAM etc.) buttons for a teammate's cell.
 fn swap_buttons(ui: &mut egui::Ui, s: &S, g: &Shared, cell: Option<i64>) {
-    let Some(swap) = g.session["positionSwaps"].as_array().into_iter().flatten().find(|w| w["cellId"].as_i64() == cell) else {
-        return;
-    };
+    for (key, path, label) in [("positionSwaps", "position-swaps", "Swap role"), ("trades", "trades", "Trade champ")] {
+        if let Some(swap) = g.session[key].as_array().into_iter().flatten().find(|w| w["cellId"].as_i64() == cell) {
+            swap_button(ui, s, swap, path, label);
+        }
+    }
+}
+
+/// State is AVAILABLE/BUSY/INVALID/RECEIVED/SENT.
+fn swap_button(ui: &mut egui::Ui, s: &S, swap: &Value, path: &str, label: &str) {
     let id = swap["id"].as_i64().unwrap_or(0);
-    let send = |verb: &str| act(s, "POST", format!("/lol-champ-select/v1/session/position-swaps/{id}/{verb}"), None);
+    let send = |verb: &str| act(s, "POST", format!("/lol-champ-select/v1/session/{path}/{id}/{verb}"), None);
     match swap["state"].as_str().unwrap_or("") {
         "AVAILABLE" => {
-            if ui.small_button("Swap role").clicked() {
+            if ui.small_button(label).clicked() {
                 send("request");
             }
         }
@@ -414,7 +420,7 @@ fn swap_buttons(ui: &mut egui::Ui, s: &S, g: &Shared, cell: Option<i64>) {
             }
         }
         "RECEIVED" => {
-            let accept = egui::Button::new(egui::RichText::new("Accept swap").strong().color(egui::Color32::BLACK)).fill(egui::Color32::from_rgb(0x0A, 0xC8, 0xB9));
+            let accept = egui::Button::new(egui::RichText::new(format!("Accept {}", label.to_lowercase())).strong().color(egui::Color32::BLACK)).fill(egui::Color32::from_rgb(0x0A, 0xC8, 0xB9));
             if ui.add(accept).clicked() {
                 send("accept");
             }
@@ -427,7 +433,37 @@ fn swap_buttons(ui: &mut egui::Ui, s: &S, g: &Shared, cell: Option<i64>) {
 }
 
 fn received_swaps(session: &Value) -> usize {
-    session["positionSwaps"].as_array().map_or(0, |a| a.iter().filter(|w| w["state"] == "RECEIVED").count())
+    ["positionSwaps", "trades"].iter().map(|k| session[*k].as_array().map_or(0, |a| a.iter().filter(|w| w["state"] == "RECEIVED").count())).sum()
+}
+
+/// ARAM-style bench: your champion, reroll, and the champions you can swap to.
+fn bench(ui: &mut egui::Ui, s: &S, g: &Shared) {
+    let sess = &g.session;
+    if sess["benchEnabled"] != true {
+        return;
+    }
+    let me = sess["myTeam"].as_array().into_iter().flatten().find(|p| p["cellId"] == sess["localPlayerCellId"]);
+    let mine = me.and_then(|p| p["championId"].as_i64()).unwrap_or(0);
+    ui.horizontal(|ui| {
+        ui.label(format!("Your champion: {}", champ_name(g, mine)));
+        let rolls = sess["rerollsRemaining"].as_i64().unwrap_or(0);
+        if ui.add_enabled(rolls > 0, egui::Button::new(format!("Reroll ({rolls})"))).clicked() {
+            act(s, "POST", "/lol-champ-select/v1/session/my-selection/reroll".into(), None);
+        }
+    });
+    let benched: Vec<i64> = sess["benchChampions"].as_array().into_iter().flatten().filter_map(|c| c["championId"].as_i64()).collect();
+    if benched.is_empty() {
+        ui.weak("Bench is empty");
+        return;
+    }
+    ui.label("Bench (click to swap):");
+    ui.horizontal_wrapped(|ui| {
+        for id in benched {
+            if ui.button(champ_name(g, id)).clicked() {
+                act(s, "POST", format!("/lol-champ-select/v1/session/bench/swap/{id}"), None);
+            }
+        }
+    });
 }
 
 /// (position, champion) for each enemy; champions show once revealed.
@@ -834,6 +870,7 @@ impl App {
             });
         }
         ui.separator();
+        bench(ui, &self.s, g);
         loadout(ui, &self.s, g);
         let enemies = enemy_team(g);
         if !enemies.is_empty() {

@@ -340,6 +340,10 @@ impl App {
             }
         });
 
+        if sess["benchEnabled"] == true {
+            card(ui, "BENCH", TEAL, |ui| bench(ui, &self.s, g));
+        }
+
         card(ui, "LOADOUT", GOLD, |ui| {
             loadout(ui, &self.s, g);
             ui.label(RichText::new("Edit rune pages via \"Full client\" in the header.").size(11.0).color(MUTED));
