@@ -2,8 +2,8 @@
 
 A small, fast desktop client for League of Legends. It replaces the Riot Client window and the heavy League client UI with one lightweight native window for the things you do every session: queue up, accept, pick/ban, and play.
 
-- ~5 MB single `.exe`, ~70 MB RAM, near-zero idle CPU
-- Saves ~1.7 GB RAM versus running the normal Riot Client + League UI
+- ~5.6 MB single `.exe`, ~85–90 MB RAM, ~0.1% of one core when idle (reacts to League's events instead of polling)
+- Saves ~1.4 GB RAM versus running the normal Riot Client + League UI (1.7 GB vs 3.1 GB total)
 - Cold start to "ready to queue" in ~25 s (the floor set by Riot's own backend)
 
 ## How it works
@@ -25,7 +25,9 @@ League reopens its own UI after games and partway through champ select; LoLite c
 - Party invites with sender name and queue, taskbar flash on new invite
 - Champ select: search, hover, lock in, ban, Arena Bravery
 - Reconnect and play again
-- **Open full client** button for anything LoLite doesn't cover (runes, store, friends, chat)
+- **Friends** list (online only by default, **Show offline** toggle) and direct-message chat with unread counts
+- English and Brazilian Portuguese (**Options → Language**; defaults to your League client's language)
+- **Open full client** button for anything LoLite doesn't cover (rune editing, store)
 - **Kill Riot** button: kills all Riot/League processes, optionally Vanguard too (see below)
 - **Options → Improved layout**: themed layout with queue tiles and champion grid; off by default (classic layout)
 
@@ -58,6 +60,9 @@ python assets/make_icon.py
 | `src/riot.rs` | Lockfile parsing, local HTTP client, launching and killing Riot processes |
 | `src/main.rs` | Background poller (state + launch flow), shared actions, classic layout |
 | `src/fancy.rs` | Improved layout and its theme |
+| `src/social.rs` | Friends list and chat (both layouts) |
+| `src/i18n.rs` | English / Portuguese text helper |
+| `scripts/bench.ps1` | Startup time + RAM: `-Mode full` (official client) vs `-Mode lolite` |
 | `assets/make_icon.py` | Generates `lolite.ico` (exe) and `icon64.rgba` (window icon) |
 | `build.rs` | Embeds the icon into the exe |
 
