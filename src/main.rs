@@ -1,11 +1,15 @@
 #![windows_subsystem = "windows"]
 mod fancy;
+mod i18n;
 mod riot;
+mod social;
 
 use eframe::egui;
+use i18n::tr;
 use riot::Api;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,6 +38,19 @@ struct Shared {
     session: Value,
     pickable: Vec<i64>,
     invites: Vec<Value>,
+    friends: Vec<Value>,
+    /// Direct-message conversation id (= friend pid) -> (sender name, unread count).
+    unread: HashMap<String, (String, i64)>,
+    my_pid: String,
+    /// Friend pid whose chat is open; empty when none.
+    chat_with: String,
+    /// Display name for `chat_with`, for chats with people not in the friend list.
+    chat_name: String,
+    messages: Vec<Value>,
+    /// When `search`/`ready` last changed; queue and ready-check timers count on from there between events.
+    timer_at: Option<Instant>,
+    /// Wakes the poller for an immediate refresh (value is an event uri, "" = game state).
+    poke: Option<Sender<String>>,
     auto_launch: bool,
     auto_accept: bool,
     want_ux: bool,
@@ -79,6 +96,10 @@ fn queue_group(q: &Value) -> &'static str {
     }
 }
 
+fn coop_prefix() -> &'static str {
+    tr("Co-op vs AI: ", "Cooperativo vs IA: ")
+}
+
 fn load_static(api: &Api, s: &S) {
     let all_queues = api.get("/lol-game-queues/v1/queues").and_then(|v| v.as_array().cloned()).unwrap_or_default();
     let queue_modes = all_queues.iter().filter_map(|q| Some((q["id"].as_i64()?, q["gameMode"].as_str()?.to_string()))).collect();
@@ -94,9 +115,10 @@ fn load_static(api: &Api, s: &S) {
         .filter_map(|q| {
             // TFT descriptions are bare ("Normal", "Ranked"); its `name` is the readable one.
             let key = if q["gameMode"] == "TFT" { "name" } else { "description" };
-            let name = q[key].as_str().filter(|n| !n.is_empty())?;
-            let name = if q["category"] == "VersusAi" { format!("Co-op vs AI: {name}") } else { name.to_string() };
-            Some((q["id"].as_i64()?, name, queue_group(q)))
+            let id = q["id"].as_i64()?;
+            let name = i18n::queue(id).or(q[key].as_str()).filter(|n| !n.is_empty())?;
+            let name = if q["category"] == "VersusAi" { format!("{}{name}", coop_prefix()) } else { name.to_string() };
+            Some((id, name, queue_group(q)))
         })
         .collect();
     queues.sort_by(|a, b| a.1.cmp(&b.1));
@@ -126,8 +148,14 @@ fn load_static(api: &Api, s: &S) {
         .get("/lol-summoner/v1/current-summoner")
         .map(|v| format!("{}#{}", v["gameName"].as_str().unwrap_or("?"), v["tagLine"].as_str().unwrap_or("")))
         .unwrap_or_default();
+    let my_pid = api.get("/lol-chat/v1/me").and_then(|v| v["pid"].as_str().map(String::from)).unwrap_or_default();
+    if setting("lang").is_none() {
+        let locale = api.get("/riotclient/region-locale").and_then(|v| v["locale"].as_str().map(String::from)).unwrap_or_default();
+        i18n::set_pt(locale.starts_with("pt"));
+    }
 
     let mut g = s.lock().unwrap();
+    g.my_pid = my_pid;
     g.queues = queues;
     g.champs = champs;
     g.spells = spells;
@@ -158,7 +186,102 @@ fn fill_name(api: &Api, names: &mut HashMap<String, String>, v: &mut Value, fiel
     }
 }
 
-fn poller(s: S, ctx: egui::Context) {
+/// LCU event uris that change what we show; the client emits many more, which are ignored.
+const WATCH: &[&str] = &["/lol-gameflow/", "/lol-lobby/", "/lol-matchmaking/", "/lol-champ-select/", "/lol-perks/", "/lol-chat/v1/friends", "/lol-chat/v1/conversations"];
+
+/// Stores `v` and reports whether it differed, so the UI repaints only when something changed.
+fn put<T: PartialEq>(slot: &mut T, v: T) -> bool {
+    if *slot == v {
+        return false;
+    }
+    *slot = v;
+    true
+}
+
+/// What the next pass refetches. Events mark parts dirty; a quiet timeout marks everything.
+#[derive(Clone, Copy)]
+struct Dirty {
+    game: bool,
+    chat: bool,
+    friends: bool,
+}
+
+const ALL: Dirty = Dirty { game: true, chat: true, friends: true };
+
+/// Everything for the current phase except chat: lobby, queue, ready check, champ select, runes, invites.
+struct Game {
+    lobby: Value,
+    search: Value,
+    ready: Value,
+    session: Value,
+    pickable: Vec<i64>,
+    rune_pages: Vec<(i64, String, bool)>,
+    rune_current: i64,
+    invites: Vec<Value>,
+}
+
+fn fetch_game(api: &Api, phase: &str, names: &mut HashMap<String, String>) -> Game {
+    let in_lobby = matches!(phase, "Lobby" | "Matchmaking" | "ReadyCheck");
+    let queued = matches!(phase, "Matchmaking" | "ReadyCheck");
+    let champ = phase == "ChampSelect";
+    let mut lobby = if in_lobby { api.get("/lol-lobby/v2/lobby") } else { None };
+    if let Some(members) = lobby.as_mut().and_then(|l| l.get_mut("members")).and_then(Value::as_array_mut) {
+        for m in members {
+            fill_name(api, names, m, "summonerName", "puuid");
+        }
+    }
+    let mut invites: Vec<Value> = api
+        .get("/lol-lobby/v2/received-invitations")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| i["state"] == "Pending")
+        .collect();
+    for inv in &mut invites {
+        fill_name(api, names, inv, "fromSummonerName", "fromPuuid");
+    }
+    Game {
+        lobby: lobby.unwrap_or(Value::Null),
+        search: if queued { api.get("/lol-matchmaking/v1/search") } else { None }.unwrap_or(Value::Null),
+        ready: if phase == "ReadyCheck" { api.get("/lol-matchmaking/v1/ready-check") } else { None }.unwrap_or(Value::Null),
+        session: if champ { api.get("/lol-champ-select/v1/session") } else { None }.unwrap_or(Value::Null),
+        pickable: if champ { ids(api.get("/lol-champ-select/v1/pickable-champion-ids")) } else { vec![] },
+        rune_pages: if champ {
+            api.get("/lol-perks/v1/pages")
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|p| p["isEditable"] == true || p["isActive"] == true)
+                .filter_map(|p| Some((p["id"].as_i64()?, p["name"].as_str()?.to_string(), p["isValid"] != false)))
+                .collect()
+        } else {
+            vec![]
+        },
+        rune_current: if champ { api.get("/lol-perks/v1/currentpage").and_then(|p| p["id"].as_i64()).unwrap_or(0) } else { 0 },
+        invites,
+    }
+}
+
+/// Unread direct-message conversations, skipping the open one.
+fn fetch_unread(api: &Api, chat_with: &str) -> HashMap<String, (String, i64)> {
+    api.get("/lol-chat/v1/conversations")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| c["type"] == "chat" && c["id"] != chat_with)
+        .filter_map(|c| {
+            let n = c["unreadMessageCount"].as_i64().filter(|n| *n > 0)?;
+            let name = match (c["gameName"].as_str().filter(|n| !n.is_empty()), c["gameTag"].as_str()) {
+                (Some(n), Some(t)) if !t.is_empty() => format!("{n}#{t}"),
+                (Some(n), _) => n.to_string(),
+                _ => c["name"].as_str().unwrap_or("?").to_string(),
+            };
+            Some((c["id"].as_str()?.to_string(), (name, n)))
+        })
+        .collect()
+}
+
+fn poller(s: S, ctx: egui::Context, tx: Sender<String>, rx: Receiver<String>) {
     let rc_lockfile = riot::rc_lockfile();
     let (mut rc_cache, mut lcu_cache) = (Cached::default(), Cached::default());
     let mut last_spawn: Option<Instant> = None;
@@ -166,17 +289,26 @@ fn poller(s: S, ctx: egui::Context) {
     let mut last_kill_ux: Option<Instant> = None;
     let mut last_phase = String::new();
     let mut last_pending = 0;
+    let mut last_turn = false;
     let mut names: HashMap<String, String> = HashMap::new();
     let mut rec_key = String::new();
     let mut recommended: Vec<(String, Value)> = vec![];
+    // Event stream state: with it we fetch on change instead of polling.
+    let mut ws_api: Option<String> = None;
+    let mut ws_tried: Option<Instant> = None;
+    let mut dirty = ALL;
+    let mut chat_at: Option<Instant> = None;
+    let mut friends_at: Option<Instant> = None;
+    let due = |at: Option<Instant>, secs: u64| at.is_none_or(|t| t.elapsed() >= Duration::from_secs(secs));
 
     loop {
-        let (auto_launch, auto_accept, want_ux, need_static) = {
+        let (auto_launch, auto_accept, want_ux, need_static, chat_with) = {
             let g = s.lock().unwrap();
-            (g.auto_launch, g.auto_accept, g.want_ux, g.champs.is_empty() || g.queues.is_empty())
+            (g.auto_launch, g.auto_accept, g.want_ux, g.champs.is_empty() || g.queues.is_empty(), g.chat_with.clone())
         };
         let lcu = lcu_cache.get(riot::LCU_LOCKFILE).filter(Api::alive);
         let phase = lcu.as_ref().and_then(|a| a.get("/lol-gameflow/v1/gameflow-phase")).and_then(|v| v.as_str().map(String::from));
+        let mut changed = false;
 
         match (lcu, phase) {
             (Some(api), Some(phase)) => {
@@ -186,8 +318,16 @@ fn poller(s: S, ctx: egui::Context) {
                 }
                 last_spawn = None;
                 launched_at = None;
+                if ws_api.as_deref() != Some(api.base()) && due(ws_tried, 10) {
+                    ws_tried = Some(Instant::now());
+                    if api.events(WATCH, tx.clone()) {
+                        ws_api = Some(api.base().to_string());
+                        dirty = ALL;
+                    }
+                }
                 if need_static {
                     load_static(&api, &s);
+                    changed = true;
                 }
                 // LCU respawns its UI after games etc; keep it dead unless asked for.
                 // It also force-shows itself ~30s into champ select, so recheck faster there.
@@ -197,93 +337,180 @@ fn poller(s: S, ctx: egui::Context) {
                     last_kill_ux = Some(Instant::now());
                 }
 
-                let in_lobby = matches!(phase.as_str(), "Lobby" | "Matchmaking" | "ReadyCheck");
-                let queued = matches!(phase.as_str(), "Matchmaking" | "ReadyCheck");
-                let mut lobby = if in_lobby { api.get("/lol-lobby/v2/lobby") } else { None };
-                if let Some(members) = lobby.as_mut().and_then(|l| l.get_mut("members")).and_then(Value::as_array_mut) {
-                    for m in members {
-                        fill_name(&api, &mut names, m, "summonerName", "puuid");
+                // In game, chat and friends wait so the game gets the CPU; friends refresh at most every 5s anyway.
+                let in_game = phase == "InProgress";
+                let do_game = dirty.game || phase != last_phase;
+                let do_chat = dirty.chat && (!in_game || due(chat_at, 5));
+                let do_friends = dirty.friends && due(friends_at, if in_game { 30 } else { 5 });
+
+                let game = do_game.then(|| fetch_game(&api, &phase, &mut names));
+                if let Some(game) = &game {
+                    if auto_accept && game.ready["playerResponse"] == "None" {
+                        let _ = api.send("POST", "/lol-matchmaking/v1/ready-check/accept", None);
+                    }
+                    // Pop the window up for a found match (even when auto-accepting) and when our pick/ban turn starts.
+                    let turn = turn_in_progress(&game.session);
+                    if (phase == "ReadyCheck" && last_phase != "ReadyCheck") || (turn && !last_turn) {
+                        bring_to_front(&ctx);
+                    }
+                    last_turn = turn;
+                    match recommended_path(&game.session, &s) {
+                        Some(path) if path != rec_key => {
+                            recommended = fetch_recommended(&api, &path);
+                            rec_key = path;
+                        }
+                        Some(_) => {}
+                        None => {
+                            recommended.clear();
+                            rec_key.clear();
+                        }
                     }
                 }
-                let search = if queued { api.get("/lol-matchmaking/v1/search") } else { None };
-                let ready = if phase == "ReadyCheck" { api.get("/lol-matchmaking/v1/ready-check") } else { None };
-                if auto_accept && ready.as_ref().is_some_and(|r| r["playerResponse"] == "None") {
-                    let _ = api.send("POST", "/lol-matchmaking/v1/ready-check/accept", None);
+                let unread = do_chat.then(|| fetch_unread(&api, &chat_with));
+                let messages = (do_chat && !chat_with.is_empty())
+                    .then(|| api.get(&format!("/lol-chat/v1/conversations/{chat_with}/messages")).and_then(|v| v.as_array().cloned()).unwrap_or_default());
+                let friends = do_friends.then(|| api.get("/lol-chat/v1/friends").and_then(|v| v.as_array().cloned()).unwrap_or_default());
+                if do_chat {
+                    dirty.chat = false;
+                    chat_at = Some(Instant::now());
                 }
-                let champ = phase == "ChampSelect";
-                let session = if champ { api.get("/lol-champ-select/v1/session") } else { None };
-                let pickable = if champ { ids(api.get("/lol-champ-select/v1/pickable-champion-ids")) } else { vec![] };
-                let rune_pages: Vec<(i64, String, bool)> = if champ {
-                    api.get("/lol-perks/v1/pages")
-                        .and_then(|v| v.as_array().cloned())
-                        .unwrap_or_default()
-                        .iter()
-                        .filter(|p| p["isEditable"] == true || p["isActive"] == true)
-                        .filter_map(|p| Some((p["id"].as_i64()?, p["name"].as_str()?.to_string(), p["isValid"] != false)))
-                        .collect()
-                } else {
-                    vec![]
-                };
-                if let Some(path) = session.as_ref().and_then(|sess| recommended_path(sess, &s)) {
-                    if path != rec_key {
-                        recommended = fetch_recommended(&api, &path);
-                        rec_key = path;
+                if do_friends {
+                    dirty.friends = false;
+                    friends_at = Some(Instant::now());
+                }
+                dirty.game = false;
+
+                let mut g = s.lock().unwrap();
+                changed |= put(&mut g.status, tr("Connected", "Conectado").to_string());
+                changed |= put(&mut g.need_login, false);
+                changed |= g.lcu.is_none();
+                g.lcu = Some(api);
+                changed |= put(&mut g.phase, phase.clone());
+                if let Some(game) = game {
+                    let timers = put(&mut g.search, game.search) | put(&mut g.ready, game.ready);
+                    if timers {
+                        g.timer_at = Some(Instant::now());
                     }
-                } else {
-                    recommended.clear();
-                    rec_key.clear();
+                    changed |= timers
+                        | put(&mut g.lobby, game.lobby)
+                        | put(&mut g.session, game.session)
+                        | put(&mut g.pickable, game.pickable)
+                        | put(&mut g.rune_pages, game.rune_pages)
+                        | put(&mut g.rune_current, game.rune_current)
+                        | put(&mut g.invites, game.invites)
+                        | put(&mut g.recommended, recommended.clone());
                 }
-                let rune_current = if champ { api.get("/lol-perks/v1/currentpage").and_then(|p| p["id"].as_i64()).unwrap_or(0) } else { 0 };
-                let mut invites: Vec<Value> = api
-                    .get("/lol-lobby/v2/received-invitations")
-                    .and_then(|v| v.as_array().cloned())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|i| i["state"] == "Pending")
-                    .collect();
-                for inv in &mut invites {
-                    fill_name(&api, &mut names, inv, "fromSummonerName", "fromPuuid");
+                if let Some(unread) = unread {
+                    changed |= put(&mut g.unread, unread);
                 }
-                // Flash the taskbar for new invites or incoming role-swap requests.
-                let pending = invites.len() + session.as_ref().map_or(0, received_swaps);
+                // The chat may have been closed or switched while we were fetching.
+                if let Some(messages) = messages.filter(|_| g.chat_with == chat_with) {
+                    changed |= put(&mut g.messages, messages);
+                }
+                if let Some(friends) = friends {
+                    changed |= put(&mut g.friends, friends);
+                }
+                // Flash the taskbar for new invites, incoming role-swap requests or unread messages.
+                let pending = g.invites.len() + received_swaps(&g.session) + g.unread.values().map(|u| u.1).sum::<i64>() as usize;
                 if pending > last_pending {
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
                 }
                 last_pending = pending;
-
-                let mut g = s.lock().unwrap();
-                g.status = "Connected".into();
-                g.need_login = false;
-                g.lcu = Some(api);
-                g.phase = phase.clone();
-                g.lobby = lobby.unwrap_or(Value::Null);
-                g.search = search.unwrap_or(Value::Null);
-                g.ready = ready.unwrap_or(Value::Null);
-                g.session = session.unwrap_or(Value::Null);
-                g.pickable = pickable;
-                g.rune_pages = rune_pages;
-                g.rune_current = rune_current;
-                g.recommended = recommended.clone();
-                g.invites = invites;
                 last_phase = phase;
             }
             _ => {
                 let (status, need_login) =
-                    if auto_launch { launch_step(&mut rc_cache, &rc_lockfile, &mut last_spawn, &mut launched_at) } else { ("Stopped".into(), false) };
+                    if auto_launch { launch_step(&mut rc_cache, &rc_lockfile, &mut last_spawn, &mut launched_at) } else { (tr("Stopped", "Parado").into(), false) };
+                ws_api = None;
                 let mut g = s.lock().unwrap();
-                g.status = status;
-                g.need_login = need_login;
+                changed |= put(&mut g.status, status) | put(&mut g.need_login, need_login) | g.lcu.is_some();
                 g.lcu = None;
                 g.phase.clear();
                 g.queues.clear();
                 g.champs.clear();
                 g.invites.clear();
+                g.friends.clear();
+                g.unread.clear();
+                g.chat_with.clear();
+                g.messages.clear();
                 last_phase.clear();
             }
         }
-        ctx.request_repaint();
+        if changed {
+            ctx.request_repaint();
+        }
+
+        // Wait for events; without the event stream, poll like before. Quiet timeouts refresh everything as a safety net.
         let fast = last_phase == "ChampSelect" || last_phase == "ReadyCheck";
-        std::thread::sleep(Duration::from_millis(if fast { 400 } else { 1000 }));
+        let wait = match (ws_api.is_some(), fast) {
+            (true, true) => Duration::from_secs(3),
+            (true, false) => Duration::from_secs(10),
+            (false, true) => Duration::from_millis(400),
+            (false, false) => Duration::from_secs(1),
+        };
+        match rx.recv_timeout(wait) {
+            Ok(uri) => {
+                // Events come in bursts; gather them before fetching once.
+                std::thread::sleep(Duration::from_millis(60));
+                for uri in std::iter::once(uri).chain(rx.try_iter()) {                    if uri == riot::CLOSED {
+                        ws_api = None;
+                        dirty = ALL;
+                    } else if uri.starts_with("/lol-chat/v1/friends") {
+                        dirty.friends = true;
+                    } else if uri.starts_with("/lol-chat/") {
+                        dirty.chat = true;
+                    } else {
+                        dirty.game = true;
+                    }
+                }
+            }
+            Err(_) => dirty = ALL,
+        }
+    }
+}
+
+fn poke(g: &Shared, uri: &str) {
+    if let Some(tx) = &g.poke {
+        let _ = tx.send(uri.into());
+    }
+}
+
+/// Seconds since the queue/ready-check data last changed.
+fn timer_secs(g: &Shared) -> f64 {
+    g.timer_at.map_or(0.0, |t| t.elapsed().as_secs_f64())
+}
+
+fn queue_time(g: &Shared) -> f64 {
+    g.search["timeInQueue"].as_f64().unwrap_or(0.0) + timer_secs(g)
+}
+
+fn ready_time(g: &Shared) -> f64 {
+    g.ready["timer"].as_f64().unwrap_or(0.0) + timer_secs(g)
+}
+
+/// Milliseconds left in the champ select phase, counting down between session updates.
+fn champ_time_left(sess: &Value) -> f64 {
+    let t = &sess["timer"];
+    let left = t["adjustedTimeLeftInPhase"].as_f64().unwrap_or(0.0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_millis() as f64);
+    match t["internalNowInEpochMs"].as_f64().filter(|at| *at > 0.0) {
+        Some(at) => (at + left - now).max(0.0),
+        None => left,
+    }
+}
+
+fn turn_in_progress(sess: &Value) -> bool {
+    let me = &sess["localPlayerCellId"];
+    sess["actions"].as_array().into_iter().flatten().filter_map(Value::as_array).flatten().any(|a| {
+        a["actorCellId"] == *me && a["isInProgress"] == true && a["completed"] == false
+    })
+}
+
+fn bring_to_front(ctx: &egui::Context) {
+    use egui::{ViewportCommand as C, WindowLevel as L};
+    // Windows often refuses to hand over focus; a topmost/normal toggle still raises the window above others.
+    for cmd in [C::Minimized(false), C::WindowLevel(L::AlwaysOnTop), C::WindowLevel(L::Normal), C::Focus] {
+        ctx.send_viewport_cmd(cmd);
     }
 }
 
@@ -297,7 +524,7 @@ fn launch_step(rc_cache: &mut Cached, rc_lockfile: &str, last_spawn: &mut Option
                 riot::start_riot_client(true);
                 *last_spawn = Some(Instant::now());
             }
-            ("Starting Riot Client…".into(), false)
+            (tr("Starting Riot Client…", "Iniciando Riot Client…").into(), false)
         }
         Some(200) => {
             // Early POSTs fail (e.g. 464 EULA) until RCS finishes loading, so retry; after success give League time to boot.
@@ -307,9 +534,9 @@ fn launch_step(rc_cache: &mut Cached, rc_lockfile: &str, last_spawn: &mut Option
                     *launched_at = Some(Instant::now());
                 }
             }
-            ("Starting League…".into(), false)
+            (tr("Starting League…", "Iniciando League…").into(), false)
         }
-        Some(_) => ("Not logged in".into(), true),
+        Some(_) => (tr("Not logged in", "Não conectado à conta").into(), true),
     }
 }
 
@@ -319,7 +546,7 @@ fn act(s: &S, method: &'static str, path: String, body: Option<Value>) {
         let api = s.lock().unwrap().lcu.clone();
         let res = match api {
             Some(api) => api.send(method, &path, body),
-            None => Err("League client not connected".into()),
+            None => Err(tr("League client not connected", "Cliente do League não conectado").into()),
         };
         s.lock().unwrap().error = res.err().unwrap_or_default();
     });
@@ -331,16 +558,16 @@ fn mmss(secs: f64) -> String {
 }
 
 fn queue_name(g: &Shared, id: i64) -> String {
-    g.queues.iter().find(|q| q.0 == id).map_or(format!("Queue {id}"), |q| q.1.clone())
+    g.queues.iter().find(|q| q.0 == id).map_or(format!("{} {id}", tr("Queue", "Fila")), |q| q.1.clone())
 }
 
 fn member_name(m: &Value) -> &str {
-    m["summonerName"].as_str().filter(|n| !n.is_empty()).unwrap_or("Player")
+    m["summonerName"].as_str().filter(|n| !n.is_empty()).unwrap_or(tr("Player", "Jogador"))
 }
 
 fn champ_name(g: &Shared, id: i64) -> String {
     match id {
-        BRAVERY => "Bravery (random)".into(),
+        BRAVERY => tr("Bravery (random)", "Bravura (aleatório)").into(),
         _ => g.champs.iter().find(|c| c.0 == id).map_or("—".into(), |c| c.1.clone()),
     }
 }
@@ -385,7 +612,7 @@ fn champ_options(g: &Shared, t: &Turn, search: &str) -> Vec<(i64, String)> {
         if ARENA_QUEUES.contains(&g.session["queueId"].as_i64().unwrap_or(0)) && !specials.contains(&BRAVERY) {
             specials.push(BRAVERY);
         }
-        out.extend(specials.into_iter().map(|id| (id, if id == BRAVERY { champ_name(g, id) } else { format!("Special {id}") })));
+        out.extend(specials.into_iter().map(|id| (id, if id == BRAVERY { champ_name(g, id) } else { format!("{} {id}", tr("Special", "Especial")) })));
     }
     // Ban: Riot's bannable list didn't match champion ids in Arena; the server validates bans anyway.
     let allowed = |id: i64| t.is_ban || g.pickable.is_empty() || g.pickable.contains(&id);
@@ -396,7 +623,10 @@ fn champ_options(g: &Shared, t: &Turn, search: &str) -> Vec<(i64, String)> {
 
 /// Role-swap (draft/ranked) and champion-trade (ARAM etc.) buttons for a teammate's cell.
 fn swap_buttons(ui: &mut egui::Ui, s: &S, g: &Shared, cell: Option<i64>) {
-    for (key, path, label) in [("positionSwaps", "position-swaps", "Swap role"), ("trades", "trades", "Trade champ")] {
+    for (key, path, label) in [
+        ("positionSwaps", "position-swaps", tr("Swap role", "Trocar rota")),
+        ("trades", "trades", tr("Trade champ", "Trocar campeão")),
+    ] {
         if let Some(swap) = g.session[key].as_array().into_iter().flatten().find(|w| w["cellId"].as_i64() == cell) {
             swap_button(ui, s, swap, path, label);
         }
@@ -414,17 +644,18 @@ fn swap_button(ui: &mut egui::Ui, s: &S, swap: &Value, path: &str, label: &str) 
             }
         }
         "SENT" => {
-            ui.weak("swap sent");
-            if ui.small_button("Cancel").clicked() {
+            ui.weak(tr("swap sent", "troca enviada"));
+            if ui.small_button(tr("Cancel", "Cancelar")).clicked() {
                 send("cancel");
             }
         }
         "RECEIVED" => {
-            let accept = egui::Button::new(egui::RichText::new(format!("Accept {}", label.to_lowercase())).strong().color(egui::Color32::BLACK)).fill(egui::Color32::from_rgb(0x0A, 0xC8, 0xB9));
+            let text = format!("{} {}", tr("Accept", "Aceitar"), label.to_lowercase());
+            let accept = egui::Button::new(egui::RichText::new(text).strong().color(egui::Color32::BLACK)).fill(egui::Color32::from_rgb(0x0A, 0xC8, 0xB9));
             if ui.add(accept).clicked() {
                 send("accept");
             }
-            if ui.small_button("Decline").clicked() {
+            if ui.small_button(tr("Decline", "Recusar")).clicked() {
                 send("decline");
             }
         }
@@ -445,18 +676,18 @@ fn bench(ui: &mut egui::Ui, s: &S, g: &Shared) {
     let me = sess["myTeam"].as_array().into_iter().flatten().find(|p| p["cellId"] == sess["localPlayerCellId"]);
     let mine = me.and_then(|p| p["championId"].as_i64()).unwrap_or(0);
     ui.horizontal(|ui| {
-        ui.label(format!("Your champion: {}", champ_name(g, mine)));
+        ui.label(format!("{} {}", tr("Your champion:", "Seu campeão:"), champ_name(g, mine)));
         let rolls = sess["rerollsRemaining"].as_i64().unwrap_or(0);
-        if ui.add_enabled(rolls > 0, egui::Button::new(format!("Reroll ({rolls})"))).clicked() {
+        if ui.add_enabled(rolls > 0, egui::Button::new(format!("{} ({rolls})", tr("Reroll", "Rerrolar")))).clicked() {
             act(s, "POST", "/lol-champ-select/v1/session/my-selection/reroll".into(), None);
         }
     });
     let benched: Vec<i64> = sess["benchChampions"].as_array().into_iter().flatten().filter_map(|c| c["championId"].as_i64()).collect();
     if benched.is_empty() {
-        ui.weak("Bench is empty");
+        ui.weak(tr("Bench is empty", "Banco vazio"));
         return;
     }
-    ui.label("Bench (click to swap):");
+    ui.label(tr("Bench (click to swap):", "Banco (clique para trocar):"));
     ui.horizontal_wrapped(|ui| {
         for id in benched {
             if ui.button(champ_name(g, id)).clicked() {
@@ -474,14 +705,24 @@ fn enemy_team(g: &Shared) -> Vec<(String, String)> {
         .flatten()
         .map(|p| {
             let id = p["championId"].as_i64().unwrap_or(0);
-            (p["assignedPosition"].as_str().unwrap_or("").to_string(), if id == 0 { "—".into() } else { champ_name(g, id) })
+            (i18n::role(p["assignedPosition"].as_str().unwrap_or("")).to_string(), if id == 0 { "—".into() } else { champ_name(g, id) })
         })
         .collect()
 }
 
-/// Comma-separated ban names for "myTeamBans" or "theirTeamBans".
-fn bans(g: &Shared, key: &str) -> String {
-    let names: Vec<String> = ids(Some(g.session["bans"][key].clone())).into_iter().filter(|id| *id > 0).map(|id| champ_name(g, id)).collect();
+/// Comma-separated names of our (ally) or their completed bans.
+/// Read from the ban actions: `session.bans` stays empty in most queues.
+fn bans(g: &Shared, ally: bool) -> String {
+    let names: Vec<String> = g.session["actions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter(|a| a["type"] == "ban" && a["completed"] == true && a["isAllyAction"] == ally)
+        .filter_map(|a| a["championId"].as_i64().filter(|id| *id > 0))
+        .map(|id| champ_name(g, id))
+        .collect();
     if names.is_empty() { "—".into() } else { names.join(", ") }
 }
 
@@ -496,7 +737,7 @@ fn loadout(ui: &mut egui::Ui, s: &S, g: &Shared) {
 
     if !spells.is_empty() {
         ui.horizontal(|ui| {
-            ui.label("Spells");
+            ui.label(tr("Spells", "Feitiços"));
             let (mut nd, mut nf) = (d, f);
             for (salt, val) in [("spell_d", &mut nd), ("spell_f", &mut nf)] {
                 egui::ComboBox::from_id_salt(salt).width(110.0).selected_text(spell_name(*val)).show_ui(ui, |ui| {
@@ -519,12 +760,12 @@ fn loadout(ui: &mut egui::Ui, s: &S, g: &Shared) {
 
     if !g.rune_pages.is_empty() {
         ui.horizontal(|ui| {
-            ui.label("Runes");
+            ui.label(tr("Runes", "Runas"));
             let current = g.rune_pages.iter().find(|p| p.0 == g.rune_current).map_or("—".to_string(), |p| p.1.clone());
             let mut pick = g.rune_current;
             egui::ComboBox::from_id_salt("runes").width(200.0).selected_text(current).show_ui(ui, |ui| {
                 for (id, name, valid) in &g.rune_pages {
-                    let label = if *valid { name.clone() } else { format!("{name} (incomplete)") };
+                    let label = if *valid { name.clone() } else { format!("{name} ({})", tr("incomplete", "incompleta")) };
                     ui.selectable_value(&mut pick, *id, label);
                 }
             });
@@ -535,10 +776,13 @@ fn loadout(ui: &mut egui::Ui, s: &S, g: &Shared) {
     }
 
     if !g.recommended.is_empty() {
-        ui.label("Recommended runes (saved to a \"LoLite\" page, or overwrites the current page if all pages are used):");
+        ui.label(tr(
+            "Recommended runes (saved to a \"LoLite\" page, or overwrites the current page if all pages are used):",
+            "Runas recomendadas (salvas numa página \"LoLite\", ou sobrescrevem a página atual se todas estiverem em uso):",
+        ));
         for (label, page) in &g.recommended {
             ui.horizontal(|ui| {
-                if ui.small_button("Use").clicked() {
+                if ui.small_button(tr("Use", "Usar")).clicked() {
                     use_runes(s, page.clone());
                 }
                 ui.label(label);
@@ -606,18 +850,38 @@ fn lock_in(s: &S, t: &Turn) {
     act(s, "PATCH", format!("/lol-champ-select/v1/session/actions/{}", t.aid), Some(json!({ "championId": t.current, "completed": true })));
 }
 
+fn vanguard_hint() -> &'static str {
+    tr(
+        "Stops vgc service + tray (UAC prompt). Kernel driver stays until reboot.",
+        "Para o serviço vgc + bandeja (pede UAC). O driver do kernel fica até reiniciar.",
+    )
+}
+
+/// Display text for a champ select timer phase.
+fn champ_select_phase(p: &str) -> &str {
+    match p {
+        "PLANNING" => tr("Planning", "Planejamento"),
+        "BAN_PICK" => tr("Ban & pick", "Banir e escolher"),
+        "FINALIZATION" => tr("Finalizing", "Finalizando"),
+        "GAME_STARTING" => tr("Game starting", "Partida iniciando"),
+        p => p,
+    }
+}
+
 fn settings_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("LoLite").join("settings.txt")
 }
 
-fn load_improved() -> bool {
-    std::fs::read_to_string(settings_path()).is_ok_and(|t| t.contains("improved_layout=1"))
+fn setting(key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(settings_path()).ok()?;
+    text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(String::from))
 }
 
-fn save_improved(on: bool) {
+fn save_settings(improved: bool) {
     let p = settings_path();
     let _ = std::fs::create_dir_all(p.parent().unwrap());
-    let _ = std::fs::write(p, format!("improved_layout={}\n", on as u8));
+    let lang = if i18n::pt() { "pt" } else { "en" };
+    let _ = std::fs::write(p, format!("improved_layout={}\nlang={lang}\n", improved as u8));
 }
 
 struct App {
@@ -626,6 +890,11 @@ struct App {
     search: String,
     kill_vanguard: bool,
     improved: bool,
+    friends_open: bool,
+    /// Queue group tab chosen in the improved layout.
+    queue_tab: Option<&'static str>,
+    show_offline: bool,
+    chat_input: String,
     /// Which layout's style is currently applied to the context.
     styled: Option<bool>,
 }
@@ -638,8 +907,29 @@ impl eframe::App for App {
             } else {
                 ui.ctx().all_styles_mut(|st| *st = egui::Style::default());
                 ui.ctx().set_visuals(egui::Visuals::dark());
+                ui.ctx().set_fonts(fancy::fonts(false));
             }
             self.styled = Some(self.improved);
+        }
+        let s = self.s.clone();
+        // Timers count down locally between events; only these phases need a tick.
+        if matches!(s.lock().unwrap().phase.as_str(), "Matchmaking" | "ReadyCheck" | "ChampSelect") {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
+        let side = egui::Frame::new().fill(ui.visuals().faint_bg_color).inner_margin(egui::Margin::symmetric(10, 8));
+        if self.friends_open {
+            egui::Panel::right("friends").resizable(true).default_size(250.0).frame(side).show(ui, |ui| self.social(ui, &mut s.lock().unwrap()));
+        } else {
+            egui::Panel::right("friends_collapsed").resizable(false).frame(side).show(ui, |ui| {
+                if ui.small_button("«").on_hover_text(tr("Friends", "Amigos")).clicked() {
+                    self.friends_open = true;
+                }
+                let unread = social::unread_total(&s.lock().unwrap());
+                if unread > 0 {
+                    ui.colored_label(egui::Color32::from_rgb(0xE8, 0x40, 0x57), egui::RichText::new(unread.to_string()).strong())
+                        .on_hover_text(tr("Unread messages", "Mensagens não lidas"));
+                }
+            });
         }
         if self.improved {
             self.draw_fancy(ui);
@@ -651,15 +941,28 @@ impl eframe::App for App {
 
 impl App {
     fn options_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("⚙ Options", |ui| {
-            if ui.checkbox(&mut self.improved, "Improved layout").changed() {
-                save_improved(self.improved);
+        ui.menu_button(tr("⚙ Options", "⚙ Opções"), |ui| {
+            if ui.checkbox(&mut self.improved, tr("Improved layout", "Layout aprimorado")).changed() {
+                save_settings(self.improved);
             }
-            ui.checkbox(&mut self.kill_vanguard, "Kill Riot also stops Vanguard")
-                .on_hover_text("Stops vgc service + tray (UAC prompt). Kernel driver stays until reboot.");
+            ui.checkbox(&mut self.kill_vanguard, tr("Kill Riot also stops Vanguard", "Fechar Riot também para o Vanguard"))
+                .on_hover_text(vanguard_hint());
+            ui.horizontal(|ui| {
+                ui.label(tr("Language", "Idioma"));
+                let mut pt = i18n::pt();
+                ui.selectable_value(&mut pt, false, "English");
+                ui.selectable_value(&mut pt, true, "Português");
+                if pt != i18n::pt() {
+                    i18n::set_pt(pt);
+                    save_settings(self.improved);
+                    // Queue names carry a translated prefix; the poller reloads them.
+                    let mut g = self.s.lock().unwrap();
+                    g.queues.clear();
+                    poke(&g, "");
+                }
+            });
         });
     }
-
     fn kill_riot(&self, g: &mut Shared) {
         g.auto_launch = false;
         g.want_ux = false;
@@ -686,28 +989,23 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.strong(if g.summoner.is_empty() { "LoLite" } else { &g.summoner });
-            ui.label(match g.phase.as_str() {
-                "" => g.status.as_str(),
-                "None" => "Idle",
-                p => p,
-            });
+            ui.label(if g.phase.is_empty() { g.status.as_str() } else { i18n::phase(&g.phase) });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.options_menu(ui));
         });
         ui.horizontal(|ui| {
             if g.lcu.is_some() {
-                if ui.button(if g.want_ux { "Hide full client" } else { "Open full client" }).clicked() {
+                if ui.button(if g.want_ux { tr("Hide full client", "Ocultar cliente completo") } else { tr("Open full client", "Abrir cliente completo") }).clicked() {
                     self.toggle_full_client(&mut g);
                 }
-            } else if !g.auto_launch && ui.button("Start League").clicked() {
+            } else if !g.auto_launch && ui.button(tr("Start League", "Iniciar League")).clicked() {
                 g.auto_launch = true;
-            } else if g.need_login && ui.button("Log in (opens Riot Client)").clicked() {
+            } else if g.need_login && ui.button(tr("Log in (opens Riot Client)", "Entrar (abre o Riot Client)")).clicked() {
                 Self::log_in();
             }
-            if ui.button("Kill Riot").clicked() {
+            if ui.button(tr("Kill Riot", "Fechar Riot")).clicked() {
                 self.kill_riot(&mut g);
             }
-            ui.checkbox(&mut self.kill_vanguard, "also Vanguard")
-                .on_hover_text("Stops vgc service + tray (UAC prompt). Kernel driver stays until reboot.");
+            ui.checkbox(&mut self.kill_vanguard, tr("also Vanguard", "e Vanguard")).on_hover_text(vanguard_hint());
         });
         if !g.error.is_empty() {
             ui.colored_label(egui::Color32::LIGHT_RED, &g.error);
@@ -716,13 +1014,13 @@ impl App {
         for inv in g.invites.clone() {
             let id = inv["invitationId"].as_str().unwrap_or("").to_string();
             ui.horizontal(|ui| {
-                let from = inv["fromSummonerName"].as_str().filter(|n| !n.is_empty()).unwrap_or("friend");
+                let from = inv["fromSummonerName"].as_str().filter(|n| !n.is_empty()).unwrap_or(tr("friend", "amigo"));
                 let queue = queue_name(&g, inv["gameConfig"]["queueId"].as_i64().unwrap_or(0));
-                ui.strong(format!("Invite: {from}  {queue}"));
-                if ui.add_enabled(inv["canAcceptInvitation"] != false, egui::Button::new("Accept")).clicked() {
+                ui.strong(format!("{} {from}  {queue}", tr("Invite:", "Convite:")));
+                if ui.add_enabled(inv["canAcceptInvitation"] != false, egui::Button::new(tr("Accept", "Aceitar"))).clicked() {
                     act(&s, "POST", format!("/lol-lobby/v2/received-invitations/{id}/accept"), None);
                 }
-                if ui.button("Decline").clicked() {
+                if ui.button(tr("Decline", "Recusar")).clicked() {
                     act(&s, "POST", format!("/lol-lobby/v2/received-invitations/{id}/decline"), None);
                 }
             });
@@ -737,10 +1035,10 @@ impl App {
             "Lobby" => {
                 self.lobby(ui, &g);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(g.lobby["canStartActivity"] == true, egui::Button::new("Find match")).clicked() {
+                    if ui.add_enabled(g.lobby["canStartActivity"] == true, egui::Button::new(tr("Find match", "Procurar partida"))).clicked() {
                         act(&s, "POST", "/lol-lobby/v2/lobby/matchmaking/search".into(), None);
                     }
-                    if ui.button("Leave").clicked() {
+                    if ui.button(tr("Leave", "Sair")).clicked() {
                         act(&s, "DELETE", "/lol-lobby/v2/lobby".into(), None);
                     }
                 });
@@ -750,56 +1048,64 @@ impl App {
             "Matchmaking" => {
                 self.lobby(ui, &g);
                 ui.heading(format!(
-                    "In queue {} (est. {})",
-                    mmss(g.search["timeInQueue"].as_f64().unwrap_or(0.0)),
+                    "{} {} ({} {})",
+                    tr("In queue", "Na fila"),
+                    mmss(queue_time(&g)),
+                    tr("est.", "est."),
                     mmss(g.search["estimatedQueueTime"].as_f64().unwrap_or(0.0))
                 ));
-                if ui.button("Cancel").clicked() {
+                if ui.button(tr("Cancel", "Cancelar")).clicked() {
                     act(&s, "DELETE", "/lol-lobby/v2/lobby/matchmaking/search".into(), None);
                 }
             }
             "ReadyCheck" => {
-                ui.heading("Match found!");
-                ui.label(format!("Your response: {}", g.ready["playerResponse"].as_str().unwrap_or("?")));
+                ui.heading(tr("Match found!", "Partida encontrada!"));
+                let response = match g.ready["playerResponse"].as_str().unwrap_or("?") {
+                    "None" => tr("none yet", "nenhuma ainda"),
+                    "Accepted" => tr("Accepted", "Aceita"),
+                    "Declined" => tr("Declined", "Recusada"),
+                    r => r,
+                };
+                ui.label(format!("{} {response}", tr("Your response:", "Sua resposta:")));
                 ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new("ACCEPT").min_size(egui::vec2(120.0, 40.0))).clicked() {
+                    if ui.add(egui::Button::new(tr("ACCEPT", "ACEITAR")).min_size(egui::vec2(120.0, 40.0))).clicked() {
                         act(&s, "POST", "/lol-matchmaking/v1/ready-check/accept".into(), None);
                     }
-                    if ui.button("Decline").clicked() {
+                    if ui.button(tr("Decline", "Recusar")).clicked() {
                         act(&s, "POST", "/lol-matchmaking/v1/ready-check/decline".into(), None);
                     }
                 });
             }
             "ChampSelect" => self.champ_select(ui, &g),
             "GameStart" | "InProgress" => {
-                ui.heading("In game");
+                ui.heading(tr("In game", "Em jogo"));
             }
             "Reconnect" => {
-                if ui.button("Reconnect").clicked() {
+                if ui.button(tr("Reconnect", "Reconectar")).clicked() {
                     act(&s, "POST", "/lol-gameflow/v1/reconnect".into(), None);
                 }
             }
             "WaitingForStats" | "PreEndOfGame" | "EndOfGame" => {
-                ui.heading("Game over");
-                if ui.button("Play again").clicked() {
+                ui.heading(tr("Game over", "Fim de jogo"));
+                if ui.button(tr("Play again", "Jogar novamente")).clicked() {
                     act(&s, "POST", "/lol-lobby/v2/play-again".into(), None);
                 }
             }
             _ => {}
         }
         ui.separator();
-        ui.checkbox(&mut g.auto_accept, "Auto-accept match");
+        ui.checkbox(&mut g.auto_accept, tr("Auto-accept match", "Aceitar partida automaticamente"));
     }
 
     fn queue_picker(&mut self, ui: &mut egui::Ui, g: &Shared) {
-        let selected = if self.queue == 0 { "Pick a queue".into() } else { queue_name(g, self.queue) };
+        let selected = if self.queue == 0 { tr("Pick a queue", "Escolha uma fila").into() } else { queue_name(g, self.queue) };
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("queue").width(220.0).selected_text(selected).show_ui(ui, |ui| {
                 for (id, n, _) in &g.queues {
                     ui.selectable_value(&mut self.queue, *id, n);
                 }
             });
-            if ui.add_enabled(self.queue != 0, egui::Button::new("Create lobby")).clicked() {
+            if ui.add_enabled(self.queue != 0, egui::Button::new(tr("Create lobby", "Criar saguão"))).clicked() {
                 act(&self.s, "POST", "/lol-lobby/v2/lobby".into(), Some(json!({ "queueId": self.queue })));
             }
         });
@@ -812,8 +1118,8 @@ impl App {
             ui.label(format!(
                 "• {}  {} {}",
                 member_name(m),
-                m["firstPositionPreference"].as_str().unwrap_or(""),
-                m["secondPositionPreference"].as_str().unwrap_or("")
+                i18n::role(m["firstPositionPreference"].as_str().unwrap_or("")),
+                i18n::role(m["secondPositionPreference"].as_str().unwrap_or(""))
             ));
         }
         if g.phase == "Lobby" && l["gameConfig"]["showPositionSelector"] == true {
@@ -826,18 +1132,18 @@ impl App {
         let mut first = me["firstPositionPreference"].as_str().unwrap_or("").to_string();
         let mut second = me["secondPositionPreference"].as_str().unwrap_or("").to_string();
         let (f0, s0) = (first.clone(), second.clone());
-        let shown = |r: &str| if r.is_empty() || r == "UNSELECTED" { "—".to_string() } else { r.to_string() };
+        let shown = |r: &str| if r.is_empty() || r == "UNSELECTED" { "—".to_string() } else { i18n::role(r).to_string() };
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("r1").selected_text(shown(&first)).show_ui(ui, |ui| {
                 for r in ROLES {
-                    ui.selectable_value(&mut first, r.to_string(), *r);
+                    ui.selectable_value(&mut first, r.to_string(), i18n::role(r));
                 }
             });
             // Riot rejects a secondary role when the primary is FILL (QPInvalidPositionSelectionRestriction).
             if first != "FILL" {
                 egui::ComboBox::from_id_salt("r2").selected_text(shown(&second)).show_ui(ui, |ui| {
                     for r in ROLES.iter().filter(|r| **r != first) {
-                        ui.selectable_value(&mut second, r.to_string(), *r);
+                        ui.selectable_value(&mut second, r.to_string(), i18n::role(r));
                     }
                 });
             }
@@ -858,14 +1164,14 @@ impl App {
     fn champ_select(&mut self, ui: &mut egui::Ui, g: &Shared) {
         let sess = &g.session;
         let me = sess["localPlayerCellId"].as_i64();
-        let left = sess["timer"]["adjustedTimeLeftInPhase"].as_f64().unwrap_or(0.0) / 1000.0;
-        ui.heading(format!("{}  {}s", sess["timer"]["phase"].as_str().unwrap_or(""), left as i64));
+        let left = champ_time_left(sess) / 1000.0;
+        ui.heading(format!("{}  {}s", champ_select_phase(sess["timer"]["phase"].as_str().unwrap_or("")), left as i64));
 
         for p in sess["myTeam"].as_array().into_iter().flatten() {
             let id = p["championId"].as_i64().filter(|i| *i != 0).or(p["championPickIntent"].as_i64()).unwrap_or(0);
-            let you = if p["cellId"].as_i64() == me { " (you)" } else { "" };
+            let you = if p["cellId"].as_i64() == me { tr(" (you)", " (você)") } else { "" };
             ui.horizontal(|ui| {
-                ui.label(format!("{:8} {}{you}", p["assignedPosition"].as_str().unwrap_or(""), champ_name(g, id)));
+                ui.label(format!("{:8} {}{you}", i18n::role(p["assignedPosition"].as_str().unwrap_or("")), champ_name(g, id)));
                 swap_buttons(ui, &self.s, g, p["cellId"].as_i64());
             });
         }
@@ -875,25 +1181,31 @@ impl App {
         let enemies = enemy_team(g);
         if !enemies.is_empty() {
             ui.separator();
-            ui.label("Enemy team:");
+            ui.label(tr("Enemy team:", "Time inimigo:"));
             for (pos, champ) in enemies {
                 ui.label(format!("{pos:8} {champ}"));
             }
-            ui.label(format!("Bans — ours: {} | theirs: {}", bans(g, "myTeamBans"), bans(g, "theirTeamBans")));
+            ui.label(format!(
+                "{} {} | {} {}",
+                tr("Bans — ours:", "Banimentos — nossos:"),
+                bans(g, true),
+                tr("theirs:", "deles:"),
+                bans(g, false)
+            ));
         }
         ui.separator();
 
         let t = match my_turn(g) {
             Ok(t) => t,
             Err(locked) => {
-                ui.label(locked.map_or("Waiting…".into(), |id| format!("Locked in: {}", champ_name(g, id))));
+                ui.label(locked.map_or(tr("Waiting…", "Aguardando…").into(), |id| format!("{} {}", tr("Locked in:", "Confirmado:"), champ_name(g, id))));
                 return;
             }
         };
         ui.horizontal(|ui| {
-            ui.label(if t.is_ban { "Ban:" } else if t.active { "Pick:" } else { "Pre-pick:" });
+            ui.label(if t.is_ban { tr("Ban:", "Banir:") } else if t.active { tr("Pick:", "Escolher:") } else { tr("Pre-pick:", "Pré-escolha:") });
             ui.text_edit_singleline(&mut self.search);
-            let verb = if t.is_ban { "Ban" } else { "Lock in" };
+            let verb = if t.is_ban { tr("Ban", "Banir") } else { tr("Lock in", "Confirmar") };
             if ui.add_enabled(t.active && t.current != 0, egui::Button::new(format!("{verb} {}", champ_name(g, t.current)))).clicked() {
                 lock_in(&self.s, &t);
             }
@@ -910,10 +1222,11 @@ impl App {
 }
 
 fn main() -> eframe::Result {
-    let s: S = Arc::new(Mutex::new(Shared { auto_launch: true, ..Default::default() }));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let s: S = Arc::new(Mutex::new(Shared { auto_launch: true, poke: Some(tx.clone()), ..Default::default() }));
     let icon = egui::IconData { rgba: include_bytes!("../assets/icon64.rgba").to_vec(), width: 64, height: 64 };
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("LoLite").with_inner_size([460.0, 680.0]).with_icon(icon),
+        viewport: egui::ViewportBuilder::default().with_title("LoLite").with_inner_size([720.0, 680.0]).with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
@@ -921,9 +1234,24 @@ fn main() -> eframe::Result {
         opts,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
+            ctx.set_fonts(fancy::fonts(false));
             let s2 = s.clone();
-            std::thread::spawn(move || poller(s2, ctx));
-            Ok(Box::new(App { s, queue: 0, search: String::new(), kill_vanguard: false, improved: load_improved(), styled: None }))
+            std::thread::spawn(move || poller(s2, ctx, tx, rx));
+            if let Some(lang) = setting("lang") {
+                i18n::set_pt(lang == "pt");
+            }
+            Ok(Box::new(App {
+                s,
+                queue: 0,
+                search: String::new(),
+                kill_vanguard: false,
+                improved: setting("improved_layout").as_deref() == Some("1"),
+                friends_open: true,
+                queue_tab: None,
+                show_offline: false,
+                chat_input: String::new(),
+                styled: None,
+            }))
         }),
     )
 }
