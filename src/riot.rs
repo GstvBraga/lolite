@@ -1,8 +1,11 @@
 use base64::Engine;
 use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 pub const RCS_EXE: &str = r"D:\Riot Games\Riot Client\RiotClientServices.exe";
@@ -20,6 +23,7 @@ pub struct Api {
     base: String,
     auth: String,
     agent: ureq::Agent,
+    tls: native_tls::TlsConnector,
 }
 
 impl Api {
@@ -36,12 +40,71 @@ impl Api {
             .build()
             .ok()?;
         let agent = ureq::AgentBuilder::new()
-            .tls_connector(Arc::new(tls))
+            .tls_connector(Arc::new(tls.clone()))
             .timeout(Duration::from_secs(15))
             .build();
         let port: u16 = parts[2].parse().ok()?;
         let token = base64::engine::general_purpose::STANDARD.encode(format!("riot:{}", parts[3]));
-        Some(Api { port, base: format!("https://127.0.0.1:{port}"), auth: format!("Basic {token}"), agent })
+        Some(Api { port, base: format!("https://127.0.0.1:{port}"), auth: format!("Basic {token}"), agent, tls })
+    }
+
+    /// Subscribes to the client's WebSocket and sends the uri of every API event starting with one of `watch` to `tx`.
+    /// Sends `CLOSED` when the connection ends. Returns false if the connection could not be opened.
+    /// Minimal WebSocket client (handshake, text frames, ping/pong): all this needs, without another dependency.
+    pub fn events(&self, watch: &'static [&'static str], tx: Sender<String>) -> bool {
+        let Ok(tcp) = TcpStream::connect(("127.0.0.1", self.port)) else { return false };
+        let Ok(mut ws) = self.tls.connect("127.0.0.1", tcp) else { return false };
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: wamp\r\nAuthorization: {}\r\n\r\n",
+            self.port, self.auth
+        );
+        if ws.write_all(req.as_bytes()).is_err() {
+            return false;
+        }
+        let mut head = Vec::new();
+        let mut b = [0u8];
+        while !head.ends_with(b"\r\n\r\n") {
+            if ws.read_exact(&mut b).is_err() || head.len() > 8192 {
+                return false;
+            }
+            head.push(b[0]);
+        }
+        if !head.starts_with(b"HTTP/1.1 101") || send_frame(&mut ws, 1, br#"[5,"OnJsonApiEvent"]"#).is_err() {
+            return false;
+        }
+        std::thread::spawn(move || {
+            let mut msg = Vec::new();
+            while let Ok((fin, op, data)) = read_frame(&mut ws) {
+                match op {
+                    0 | 1 => msg.extend_from_slice(&data),
+                    8 => break,
+                    9 => {
+                        let _ = send_frame(&mut ws, 10, &data);
+                        continue;
+                    }
+                    _ => continue,
+                }
+                if !fin {
+                    continue;
+                }
+                // Event: [8, "OnJsonApiEvent", {"uri": ..., "data": ..., "eventType": ...}]
+                let uri = serde_json::from_slice::<Value>(&msg).ok().and_then(|v| v[2]["uri"].as_str().map(String::from));
+                msg.clear();
+                if let Some(uri) = uri.filter(|u| watch.iter().any(|w| u.starts_with(w)))
+                    && tx.send(uri).is_err()
+                {
+                    return;
+                }
+            }
+            let _ = tx.send(CLOSED.into());
+        });
+        true
+    }
+
+    /// Identifies this client instance (port changes when it restarts).
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     pub fn get(&self, path: &str) -> Option<Value> {
@@ -78,6 +141,52 @@ impl Api {
             Err(e) => Err(format!("{method} {path}: {e}")),
         }
     }
+}
+
+pub const CLOSED: &str = "!closed";
+
+type Tls = native_tls::TlsStream<TcpStream>;
+
+/// Returns (final fragment, opcode, payload). Server frames are never masked.
+fn read_frame(ws: &mut Tls) -> std::io::Result<(bool, u8, Vec<u8>)> {
+    let mut h = [0u8; 2];
+    ws.read_exact(&mut h)?;
+    let len = match h[1] & 0x7F {
+        126 => {
+            let mut n = [0u8; 2];
+            ws.read_exact(&mut n)?;
+            u16::from_be_bytes(n) as usize
+        }
+        127 => {
+            let mut n = [0u8; 8];
+            ws.read_exact(&mut n)?;
+            u64::from_be_bytes(n) as usize
+        }
+        n => n as usize,
+    };
+    let mut data = vec![0u8; len];
+    ws.read_exact(&mut data)?;
+    Ok((h[0] & 0x80 != 0, h[0] & 0x0F, data))
+}
+
+/// Client frames must be masked; the key doesn't matter for a local server.
+fn send_frame(ws: &mut Tls, op: u8, data: &[u8]) -> std::io::Result<()> {
+    const KEY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+    let mut f = vec![0x80 | op];
+    match data.len() {
+        n if n < 126 => f.push(0x80 | n as u8),
+        n if n <= 0xFFFF => {
+            f.push(0x80 | 126);
+            f.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            f.push(0x80 | 127);
+            f.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+    }
+    f.extend_from_slice(&KEY);
+    f.extend(data.iter().enumerate().map(|(i, b)| b ^ KEY[i % 4]));
+    ws.write_all(&f)
 }
 
 fn run_hidden(exe: &str, args: &[&str]) {
