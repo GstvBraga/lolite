@@ -61,7 +61,6 @@ type S = Arc<Mutex<Shared>>;
 
 /// Arena "Bravery": lock a random champion for bonus gold.
 const BRAVERY: i64 = -3;
-const ARENA_QUEUES: &[i64] = &[1700, 1710, 1750];
 const ROLES: &[&str] = &["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY", "FILL"];
 
 /// Re-reads the lockfile each tick but only rebuilds the client when it changes.
@@ -452,7 +451,8 @@ fn poller(s: S, ctx: egui::Context, tx: Sender<String>, rx: Receiver<String>) {
             Ok(uri) => {
                 // Events come in bursts; gather them before fetching once.
                 std::thread::sleep(Duration::from_millis(60));
-                for uri in std::iter::once(uri).chain(rx.try_iter()) {                    if uri == riot::CLOSED {
+                for uri in std::iter::once(uri).chain(rx.try_iter()) {
+                    if uri == riot::CLOSED {
                         ws_api = None;
                         dirty = ALL;
                     } else if uri.starts_with("/lol-chat/v1/friends") {
@@ -609,7 +609,9 @@ fn champ_options(g: &Shared, t: &Turn, search: &str) -> Vec<(i64, String)> {
     let mut out = Vec::new();
     if !t.is_ban {
         let mut specials: Vec<i64> = g.pickable.iter().copied().filter(|id| *id < 0).collect();
-        if ARENA_QUEUES.contains(&g.session["queueId"].as_i64().unwrap_or(0)) && !specials.contains(&BRAVERY) {
+        // Arena gets new queue ids over time (1700, 1710, 1740, 1750...), its game mode stays CHERRY.
+        let arena = g.queue_modes.get(&g.session["queueId"].as_i64().unwrap_or(0)).is_some_and(|m| m == "CHERRY");
+        if arena && !specials.contains(&BRAVERY) {
             specials.push(BRAVERY);
         }
         out.extend(specials.into_iter().map(|id| (id, if id == BRAVERY { champ_name(g, id) } else { format!("{} {id}", tr("Special", "Especial")) })));
@@ -724,6 +726,32 @@ fn bans(g: &Shared, ally: bool) -> String {
         .map(|id| champ_name(g, id))
         .collect();
     if names.is_empty() { "—".into() } else { names.join(", ") }
+}
+
+/// Pick turns in order as (label, ally, in progress); the label is the champion once known, else the role.
+fn pick_order(g: &Shared) -> Vec<(String, bool, bool)> {
+    let sess = &g.session;
+    let players: Vec<&Value> = ["myTeam", "theirTeam"].iter().flat_map(|t| sess[*t].as_array().into_iter().flatten()).collect();
+    sess["actions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter(|a| a["type"] == "pick")
+        .map(|a| {
+            let p = players.iter().find(|p| p["cellId"] == a["actorCellId"]);
+            let id = a["championId"].as_i64().filter(|i| *i > 0).or_else(|| p.and_then(|p| p["championPickIntent"].as_i64())).unwrap_or(0);
+            let label = if id > 0 {
+                champ_name(g, id)
+            } else if a["actorCellId"] == sess["localPlayerCellId"] {
+                tr("You", "Você").into()
+            } else {
+                p.and_then(|p| p["assignedPosition"].as_str()).filter(|r| !r.is_empty()).map_or("?".into(), |r| i18n::role(r).to_string())
+            };
+            (label, a["isAllyAction"] == true, a["isInProgress"] == true)
+        })
+        .collect()
 }
 
 /// Summoner spells + rune page pickers for champ select; shared by both layouts.
@@ -1166,6 +1194,10 @@ impl App {
         let me = sess["localPlayerCellId"].as_i64();
         let left = champ_time_left(sess) / 1000.0;
         ui.heading(format!("{}  {}s", champ_select_phase(sess["timer"]["phase"].as_str().unwrap_or("")), left as i64));
+        let order: Vec<String> = pick_order(g).into_iter().enumerate().map(|(i, (l, _, now))| format!("{}{}. {l}", if now { "▶ " } else { "" }, i + 1)).collect();
+        if !order.is_empty() {
+            ui.label(format!("{} {}", tr("Pick order:", "Ordem de escolha:"), order.join("   ")));
+        }
 
         for p in sess["myTeam"].as_array().into_iter().flatten() {
             let id = p["championId"].as_i64().filter(|i| *i != 0).or(p["championPickIntent"].as_i64()).unwrap_or(0);

@@ -169,12 +169,12 @@ fn toggle(ui: &mut Ui, on: &mut bool, label: &str) {
 }
 
 /// Small rounded tag, e.g. a role or a ban.
+/// Allocated as one fixed-size widget so wrapped rows move it to the next line instead of squeezing it.
 fn tag(ui: &mut Ui, text: &str, color: Color32) {
-    Frame::new()
-        .fill(color.gamma_multiply(0.16))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(7, 2))
-        .show(ui, |ui| ui.label(RichText::new(text).size(12.0).color(color)));
+    let galley = ui.painter().layout_no_wrap(text.into(), FontId::proportional(12.0), color);
+    let (rect, _) = ui.allocate_exact_size(galley.size() + vec2(14.0, 4.0), Sense::hover());
+    ui.painter().rect_filled(rect, 6, color.gamma_multiply(0.16));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
 }
 
 fn phase_step(phase: &str) -> Option<usize> {
@@ -281,6 +281,10 @@ impl App {
         });
 
         egui::CentralPanel::default().frame(Frame::new().fill(CANVAS).inner_margin(Margin { left: 18, right: 18, top: 6, bottom: 6 })).show(ui, |ui| {
+            // Timer and pick order stay pinned while the picker and runes scroll.
+            if g.phase == "ChampSelect" {
+                champ_select_header(ui, &g);
+            }
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.fancy_body(ui, &mut g));
         });
     }
@@ -507,69 +511,6 @@ impl App {
 
     fn fancy_champ_select(&mut self, ui: &mut Ui, g: &Shared) {
         let sess = &g.session;
-        let left = champ_time_left(sess);
-        let total = sess["timer"]["totalTimeInPhase"].as_f64().unwrap_or(0.0);
-        let me = sess["localPlayerCellId"].as_i64();
-        let enemies = enemy_team(g);
-
-        card(ui, "", |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(bold(champ_select_phase(sess["timer"]["phase"].as_str().unwrap_or("")), 20.0));
-                    ui.label(sub(queue_name(g, sess["queueId"].as_i64().unwrap_or(0))));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let frac = if total > 0.0 { left / total } else { 0.0 };
-                    ring(ui, frac, (left / 1000.0).ceil() as i64, 22.0, if left < 10_000.0 { WARN } else { ACCENT });
-                });
-            });
-            ui.add_space(6.0);
-            ui.columns(if enemies.is_empty() { 1 } else { 2 }, |cols| {
-                team_heading(&mut cols[0], tr("Your team", "Seu time"), ACCENT);
-                for p in sess["myTeam"].as_array().into_iter().flatten() {
-                    let id = p["championId"].as_i64().filter(|i| *i != 0).or(p["championPickIntent"].as_i64()).unwrap_or(0);
-                    let you = p["cellId"].as_i64() == me;
-                    let player = p["gameName"].as_str().filter(|n| !n.is_empty()).unwrap_or(tr("Teammate", "Aliado"));
-                    let ui = &mut cols[0];
-                    Frame::new()
-                        .fill(if you { ACCENT_TINT } else { Color32::TRANSPARENT })
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(Margin::symmetric(8, 5))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.horizontal(|ui| {
-                                ui.label(bold(champ_name(g, id), 14.0).color(if id == 0 { SUB } else { TEXT }));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(RichText::new(i18n::role(p["assignedPosition"].as_str().unwrap_or(""))).size(12.0).color(SUB));
-                                });
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label(sub(if you { tr("You", "Você") } else { player }));
-                                swap_buttons(ui, &self.s, g, p["cellId"].as_i64());
-                            });
-                        });
-                }
-                ban_row(&mut cols[0], g, true);
-                if let Some(ui) = cols.get_mut(1) {
-                    team_heading(ui, tr("Enemy team", "Time inimigo"), BAD);
-                    for (pos, champ) in &enemies {
-                        Frame::new().inner_margin(Margin::symmetric(8, 5)).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.horizontal(|ui| {
-                                ui.label(bold(champ, 14.0).color(if champ == "—" { SUB } else { TEXT }));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(pos).size(12.0).color(SUB)));
-                            });
-                            ui.label(sub(" "));
-                        });
-                    }
-                    ban_row(ui, g, false);
-                }
-            });
-        });
-
         match my_turn(g) {
             Ok(t) => {
                 let (heading, accent) = match (t.is_ban, t.active) {
@@ -586,19 +527,22 @@ impl App {
                         lock_in(&self.s, &t);
                     }
                     ui.add_space(4.0);
-                    let cols = 4;
-                    let w = (ui.available_width() - ui.spacing().item_spacing.x * (cols - 1) as f32) / cols as f32;
                     let options = champ_options(g, &t, &self.search);
-                    for row in options.chunks(cols) {
-                        ui.horizontal(|ui| {
-                            for (id, name) in row {
-                                let tile = Button::new(RichText::new(name).size(13.0)).min_size(vec2(w, 32.0)).selected(*id == t.current);
-                                if ui.add(tile).clicked() {
-                                    hover(&self.s, &t, *id);
+                    // Own short scroll so runes stay right below instead of after every champion.
+                    egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+                        let cols = ((ui.available_width() / 120.0) as usize).clamp(2, 6);
+                        let w = (ui.available_width() - ui.spacing().item_spacing.x * (cols - 1) as f32) / cols as f32;
+                        for row in options.chunks(cols) {
+                            ui.horizontal(|ui| {
+                                for (id, name) in row {
+                                    let tile = Button::new(RichText::new(name).size(13.0)).min_size(vec2(w, 32.0)).selected(*id == t.current);
+                                    if ui.add(tile).clicked() {
+                                        hover(&self.s, &t, *id);
+                                    }
                                 }
-                            }
-                        });
-                    }
+                            });
+                        }
+                    });
                 });
             }
             Err(locked) => card(ui, "", |ui| match locked {
@@ -612,14 +556,108 @@ impl App {
             }),
         }
 
-        if sess["benchEnabled"] == true {
-            card(ui, tr("Bench", "Banco"), |ui| bench(ui, &self.s, g));
-        }
         card(ui, tr("Spells and runes", "Feitiços e runas"), |ui| {
             loadout(ui, &self.s, g);
             ui.label(sub(tr("Edit rune pages in the full client.", "Edite páginas de runas no cliente completo.")));
         });
+        if sess["benchEnabled"] == true {
+            card(ui, tr("Bench", "Banco"), |ui| bench(ui, &self.s, g));
+        }
+
+        let enemies = enemy_team(g);
+        card(ui, "", |ui| {
+            // Side by side when there's room, stacked on narrow windows.
+            if !enemies.is_empty() && ui.available_width() >= 460.0 {
+                ui.columns(2, |cols| {
+                    self.ally_team(&mut cols[0], g);
+                    enemy_list(&mut cols[1], g, &enemies);
+                });
+            } else {
+                self.ally_team(ui, g);
+                if !enemies.is_empty() {
+                    ui.add_space(8.0);
+                    enemy_list(ui, g, &enemies);
+                }
+            }
+        });
     }
+
+    fn ally_team(&self, ui: &mut Ui, g: &Shared) {
+        let sess = &g.session;
+        let me = sess["localPlayerCellId"].as_i64();
+        team_heading(ui, tr("Your team", "Seu time"), ACCENT);
+        for p in sess["myTeam"].as_array().into_iter().flatten() {
+            let id = p["championId"].as_i64().filter(|i| *i != 0).or(p["championPickIntent"].as_i64()).unwrap_or(0);
+            let you = p["cellId"].as_i64() == me;
+            let player = p["gameName"].as_str().filter(|n| !n.is_empty()).unwrap_or(tr("Teammate", "Aliado"));
+            Frame::new()
+                .fill(if you { ACCENT_TINT } else { Color32::TRANSPARENT })
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.horizontal(|ui| {
+                        ui.label(bold(champ_name(g, id), 14.0).color(if id == 0 { SUB } else { TEXT }));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(i18n::role(p["assignedPosition"].as_str().unwrap_or(""))).size(12.0).color(SUB));
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(sub(if you { tr("You", "Você") } else { player }));
+                        swap_buttons(ui, &self.s, g, p["cellId"].as_i64());
+                    });
+                });
+        }
+        ban_row(ui, g, true);
+    }
+}
+
+/// Phase, timer and pick order; drawn above the scroll area so it never scrolls away.
+fn champ_select_header(ui: &mut Ui, g: &Shared) {
+    let sess = &g.session;
+    let left = champ_time_left(sess);
+    let total = sess["timer"]["totalTimeInPhase"].as_f64().unwrap_or(0.0);
+    card(ui, "", |ui| {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(bold(champ_select_phase(sess["timer"]["phase"].as_str().unwrap_or("")), 20.0));
+                ui.label(sub(queue_name(g, sess["queueId"].as_i64().unwrap_or(0))));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let frac = if total > 0.0 { left / total } else { 0.0 };
+                ring(ui, frac, (left / 1000.0).ceil() as i64, 22.0, if left < 10_000.0 { WARN } else { ACCENT });
+            });
+        });
+        let order = pick_order(g);
+        if !order.is_empty() {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(tr("Pick order", "Ordem de escolha")).size(12.0).color(SUB));
+                for (i, (label, ally, now)) in order.iter().enumerate() {
+                    let color = if *now { WARN } else if *ally { ACCENT } else { BAD };
+                    tag(ui, &format!("{}{} {label}", if *now { "▶ " } else { "" }, i + 1), color);
+                }
+            });
+        }
+    });
+}
+
+fn enemy_list(ui: &mut Ui, g: &Shared, enemies: &[(String, String)]) {
+    team_heading(ui, tr("Enemy team", "Time inimigo"), BAD);
+    for (pos, champ) in enemies {
+        Frame::new().inner_margin(Margin::symmetric(8, 5)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.horizontal(|ui| {
+                ui.label(bold(champ, 14.0).color(if champ == "—" { SUB } else { TEXT }));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(pos).size(12.0).color(SUB)));
+            });
+            ui.label(sub(" "));
+        });
+    }
+    ban_row(ui, g, false);
 }
 
 fn team_heading(ui: &mut Ui, text: &str, color: Color32) {
