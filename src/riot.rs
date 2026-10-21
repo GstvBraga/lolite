@@ -222,6 +222,24 @@ fn run_hidden(exe: &str, args: &[&str]) {
     let _ = Command::new(exe).args(args).creation_flags(NO_WINDOW).spawn().and_then(|mut c| c.wait());
 }
 
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn IsWindowVisible(hwnd: isize) -> i32;
+}
+
+/// Whether a visible top-level window matches `class` and/or `title`. A few microseconds, no process spawn.
+pub fn window_shown(class: Option<&str>, title: Option<&str>) -> bool {
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (c, t) = (class.map(wide), title.map(wide));
+    let ptr = |v: &Option<Vec<u16>>| v.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+    // SAFETY: both pointers are null or NUL-terminated buffers that outlive the call.
+    unsafe {
+        let hwnd = FindWindowW(ptr(&c), ptr(&t));
+        hwnd != 0 && IsWindowVisible(hwnd) != 0
+    }
+}
+
 pub fn kill(images: &[&str]) {
     for img in images {
         run_hidden("taskkill", &["/F", "/T", "/IM", img]);

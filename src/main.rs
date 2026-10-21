@@ -55,6 +55,8 @@ struct Shared {
     auto_accept: bool,
     want_ux: bool,
     need_login: bool,
+    /// Auto pick: up to 5 champions per lane (order of `LANES`), in priority order; all empty = off.
+    auto_picks: Picks,
 }
 
 type S = Arc<Mutex<Shared>>;
@@ -62,6 +64,8 @@ type S = Arc<Mutex<Shared>>;
 /// Arena "Bravery": lock a random champion for bonus gold.
 const BRAVERY: i64 = -3;
 const ROLES: &[&str] = &["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY", "FILL"];
+const LANES: [&str; 5] = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"];
+type Picks = [Vec<i64>; 5];
 
 /// Re-reads the lockfile each tick but only rebuilds the client when it changes.
 #[derive(Default)]
@@ -129,7 +133,8 @@ fn load_static(api: &Api, s: &S) {
         .iter()
         .filter_map(|c| Some((c["id"].as_i64().filter(|id| *id > 0)?, c["name"].as_str()?.to_string())))
         .collect();
-    champs.sort_by(|a, b| a.1.cmp(&b.1));
+    // By name, then id, so a champion's mode variants come right after it (see `base_champs`).
+    champs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
     let mut spells: Vec<(i64, String, Vec<String>)> = api
         .get("/lol-game-data/assets/v1/summoner-spells.json")
@@ -285,10 +290,10 @@ fn poller(s: S, ctx: egui::Context, tx: Sender<String>, rx: Receiver<String>) {
     let (mut rc_cache, mut lcu_cache) = (Cached::default(), Cached::default());
     let mut last_spawn: Option<Instant> = None;
     let mut launched_at: Option<Instant> = None;
-    let mut last_kill_ux: Option<Instant> = None;
     let mut last_phase = String::new();
     let mut last_pending = 0;
     let mut last_turn = false;
+    let mut picked = AutoPick::default();
     let mut names: HashMap<String, String> = HashMap::new();
     let mut rec_key = String::new();
     let mut recommended: Vec<(String, Value)> = vec![];
@@ -301,9 +306,9 @@ fn poller(s: S, ctx: egui::Context, tx: Sender<String>, rx: Receiver<String>) {
     let due = |at: Option<Instant>, secs: u64| at.is_none_or(|t| t.elapsed() >= Duration::from_secs(secs));
 
     loop {
-        let (auto_launch, auto_accept, want_ux, need_static, chat_with) = {
+        let (auto_launch, auto_accept, auto_picks, need_static, chat_with) = {
             let g = s.lock().unwrap();
-            (g.auto_launch, g.auto_accept, g.want_ux, g.champs.is_empty() || g.queues.is_empty(), g.chat_with.clone())
+            (g.auto_launch, g.auto_accept, g.auto_picks.clone(), g.champs.is_empty() || g.queues.is_empty(), g.chat_with.clone())
         };
         let lcu = lcu_cache.get(&riot::lcu_lockfile()).filter(Api::alive);
         let phase = lcu.as_ref().and_then(|a| a.get("/lol-gameflow/v1/gameflow-phase")).and_then(|v| v.as_str().map(String::from));
@@ -328,14 +333,6 @@ fn poller(s: S, ctx: egui::Context, tx: Sender<String>, rx: Receiver<String>) {
                     load_static(&api, &s);
                     changed = true;
                 }
-                // LCU respawns its UI after games etc; keep it dead unless asked for.
-                // It also force-shows itself ~30s into champ select, so recheck faster there.
-                let every = Duration::from_secs(if phase == "ChampSelect" { 3 } else { 15 });
-                let ux_due = phase != last_phase || last_kill_ux.is_none_or(|t| t.elapsed() > every);
-                if !want_ux && phase != "InProgress" && ux_due && api.send("POST", "/riotclient/kill-ux", None).is_ok() {
-                    last_kill_ux = Some(Instant::now());
-                }
-
                 // In game, chat and friends wait so the game gets the CPU; friends refresh at most every 5s anyway.
                 let in_game = phase == "InProgress";
                 let do_game = dirty.game || phase != last_phase;
@@ -353,6 +350,9 @@ fn poller(s: S, ctx: egui::Context, tx: Sender<String>, rx: Receiver<String>) {
                         bring_to_front(&ctx);
                     }
                     last_turn = turn;
+                    if auto_picks.iter().any(|l| !l.is_empty()) && phase == "ChampSelect" {
+                        auto_pick(&api, &s, game, &auto_picks, &mut picked);
+                    }
                     match recommended_path(&game.session, &s) {
                         Some(path) if path != rec_key => {
                             recommended = fetch_recommended(&api, &path);
@@ -514,6 +514,51 @@ fn bring_to_front(ctx: &egui::Context) {
     }
 }
 
+/// League reopens its own UI by itself (match found, champ select, after games). Checks every second and closes it
+/// unless the player asked for the full client. Its ux-state can say "Quit" while a window is up, so the League
+/// ("RCLIENT") and Riot Client windows are checked too. Changes go to lolite.log to trace pop-ups.
+fn ux_guard(s: S) {
+    let (mut last_phase, mut last_state, mut last_windows) = (String::new(), None, (false, false));
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let (api, phase, want_ux) = {
+            let g = s.lock().unwrap();
+            (g.lcu.clone(), g.phase.clone(), g.want_ux)
+        };
+        let Some(api) = api else { continue };
+        let state = api.get("/riotclient/ux-state");
+        let windows = (riot::window_shown(Some("RCLIENT"), None), riot::window_shown(None, Some("Riot Client")));
+        let new_phase = phase != last_phase;
+        let changed = new_phase || state != last_state || windows != last_windows;
+        if changed {
+            log(&format!("phase={phase} ux-state={state:?} want_ux={want_ux} league_window={} riot_window={}", windows.0, windows.1));
+        }
+        let shown = state.as_ref().is_some_and(|v| v != "Quit") || windows.0;
+        // In game League keeps its UI hidden on its own.
+        if !want_ux && phase != "InProgress" {
+            if shown || new_phase {
+                let res = api.send("POST", "/riotclient/kill-ux", None);
+                if shown && changed {
+                    log(&format!("kill-ux: {res:?}"));
+                }
+            }
+            // LCU only runs once the login is done, so the Riot Client window isn't needed for it anymore.
+            if windows.1 {
+                riot::kill(&[riot::RIOT_ELECTRON]);
+            }
+        }
+        (last_phase, last_state, last_windows) = (phase, state, windows);
+    }
+}
+
+fn log(line: &str) {
+    use std::io::Write;
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(settings_path().with_file_name("lolite.log")) {
+        let _ = writeln!(f, "{secs} {line}");
+    }
+}
+
 /// One step of: start headless Riot Client -> wait for saved login -> press Play.
 /// Returns (status, needs_login).
 fn launch_step(rc_cache: &mut Cached, rc_lockfile: &str, last_spawn: &mut Option<Instant>, launched_at: &mut Option<Instant>) -> (String, bool) {
@@ -604,6 +649,11 @@ fn my_turn(g: &Shared) -> Result<Turn, Option<i64>> {
     }
 }
 
+/// One entry per champion: Riot also lists mode variants (e.g. id 60080 "Jade_Pantheon") under the base name.
+fn base_champs(g: &Shared) -> impl Iterator<Item = &(i64, String)> {
+    g.champs.iter().enumerate().filter(|(i, c)| *i == 0 || g.champs[i - 1].1 != c.1).map(|(_, c)| c)
+}
+
 /// Champions offered for this turn, filtered by search.
 fn champ_options(g: &Shared, t: &Turn, search: &str) -> Vec<(i64, String)> {
     let mut out = Vec::new();
@@ -617,9 +667,14 @@ fn champ_options(g: &Shared, t: &Turn, search: &str) -> Vec<(i64, String)> {
         out.extend(specials.into_iter().map(|id| (id, if id == BRAVERY { champ_name(g, id) } else { format!("{} {id}", tr("Special", "Especial")) })));
     }
     // Ban: Riot's bannable list didn't match champion ids in Arena; the server validates bans anyway.
-    let allowed = |id: i64| t.is_ban || g.pickable.is_empty() || g.pickable.contains(&id);
+    // Without a pickable list (bans, or not loaded yet) offer each champion once; with one, exactly what it allows.
     let q = search.to_lowercase();
-    out.extend(g.champs.iter().filter(|c| allowed(c.0) && c.1.to_lowercase().contains(&q)).cloned());
+    let matches = |c: &&(i64, String)| c.1.to_lowercase().contains(&q);
+    if t.is_ban || g.pickable.is_empty() {
+        out.extend(base_champs(g).filter(matches).cloned());
+    } else {
+        out.extend(g.champs.iter().filter(|c| g.pickable.contains(&c.0)).filter(matches).cloned());
+    }
     out
 }
 
@@ -823,6 +878,12 @@ fn loadout(ui: &mut egui::Ui, s: &S, g: &Shared) {
 fn recommended_path(sess: &Value, s: &S) -> Option<String> {
     let me = sess["myTeam"].as_array()?.iter().find(|p| p["cellId"] == sess["localPlayerCellId"])?;
     let champ = [me["championId"].as_i64(), me["championPickIntent"].as_i64()].into_iter().flatten().find(|id| *id > 0)?;
+    champ_rec_path(sess, s, champ)
+}
+
+/// Recommended-pages path for `champ` in my role on this map.
+fn champ_rec_path(sess: &Value, s: &S, champ: i64) -> Option<String> {
+    let me = sess["myTeam"].as_array()?.iter().find(|p| p["cellId"] == sess["localPlayerCellId"])?;
     let pos = me["assignedPosition"].as_str().filter(|p| !p.is_empty()).unwrap_or("none").to_lowercase();
     let map = *s.lock().unwrap().queue_maps.get(&sess["queueId"].as_i64()?)?;
     Some(format!("/lol-perks/v1/recommended-pages/champion/{champ}/position/{pos}/map/{map}"))
@@ -838,36 +899,94 @@ fn fetch_recommended(api: &Api, path: &str) -> Vec<(String, Value)> {
             let perks = r["perks"].as_array()?;
             let names: Vec<&str> = perks.iter().take(4).filter_map(|p| p["name"].as_str()).collect();
             let label = format!("{} — {}", names.first()?, names[1..].join(", "));
-            let ids: Vec<i64> = perks.iter().filter_map(|p| p["id"].as_i64()).collect();
-            Some((label, json!({ "primaryStyleId": r["primaryPerkStyleId"], "subStyleId": r["secondaryPerkStyleId"], "selectedPerkIds": ids })))
+            Some((label, rec_page(r)))
         })
         .collect()
 }
 
-/// Writes a recommended page into the "LoLite" page, a new page if there is room, or else the current page.
-fn use_runes(s: &S, mut page: Value) {
+/// Rune page body from a recommended-pages entry.
+fn rec_page(r: &Value) -> Value {
+    let ids: Vec<i64> = r["perks"].as_array().into_iter().flatten().filter_map(|p| p["id"].as_i64()).collect();
+    json!({ "primaryStyleId": r["primaryPerkStyleId"], "subStyleId": r["secondaryPerkStyleId"], "selectedPerkIds": ids })
+}
+
+fn use_runes(s: &S, page: Value) {
     let s = s.clone();
     std::thread::spawn(move || {
         let Some(api) = s.lock().unwrap().lcu.clone() else { return };
-        let pages = api.get("/lol-perks/v1/pages").and_then(|v| v.as_array().cloned()).unwrap_or_default();
-        let current = api.get("/lol-perks/v1/currentpage");
-        let room = api.get("/lol-perks/v1/inventory").is_some_and(|i| i["canAddCustomPage"] == true);
-        let target = pages
-            .iter()
-            .find(|p| p["isEditable"] == true && p["name"] == "LoLite")
-            .or(if room { None } else { current.as_ref().filter(|p| p["isEditable"] == true) })
-            .and_then(|p| p["id"].as_i64());
-        page["name"] = json!("LoLite");
-        page["current"] = json!(true);
-        let res = match target {
-            Some(id) => {
-                page["id"] = json!(id);
-                api.send("PUT", &format!("/lol-perks/v1/pages/{id}"), Some(page)).and_then(|_| api.send("PUT", "/lol-perks/v1/currentpage", Some(json!(id))))
-            }
-            None => api.send("POST", "/lol-perks/v1/pages", Some(page)),
-        };
-        s.lock().unwrap().error = res.err().unwrap_or_default();
+        s.lock().unwrap().error = save_runes(&api, page).err().unwrap_or_default();
     });
+}
+
+/// Writes a recommended page into the "LoLite" page, a new page if there is room, or else the current page.
+fn save_runes(api: &Api, mut page: Value) -> Result<(), String> {
+    let pages = api.get("/lol-perks/v1/pages").and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    let current = api.get("/lol-perks/v1/currentpage");
+    let room = api.get("/lol-perks/v1/inventory").is_some_and(|i| i["canAddCustomPage"] == true);
+    let target = pages
+        .iter()
+        .find(|p| p["isEditable"] == true && p["name"] == "LoLite")
+        .or(if room { None } else { current.as_ref().filter(|p| p["isEditable"] == true) })
+        .and_then(|p| p["id"].as_i64());
+    page["name"] = json!("LoLite");
+    page["current"] = json!(true);
+    match target {
+        Some(id) => {
+            page["id"] = json!(id);
+            api.send("PUT", &format!("/lol-perks/v1/pages/{id}"), Some(page)).and_then(|_| api.send("PUT", "/lol-perks/v1/currentpage", Some(json!(id))))
+        }
+        None => api.send("POST", "/lol-perks/v1/pages", Some(page)),
+    }
+}
+
+/// Auto pick progress: the pick action we pre-picked on (and with which champion), and the one we locked.
+#[derive(Default)]
+struct AutoPick {
+    hovered: (i64, i64),
+    locked: i64,
+}
+
+/// Deadlock-style auto pick: pre-picks the first priority champion for our assigned lane still available (every lane
+/// in order when the queue assigns none), then on our turn sets its recommended spells and runes and locks it.
+/// Steps aside once the player hovers something else themselves.
+fn auto_pick(api: &Api, s: &S, game: &Game, picks: &Picks, done: &mut AutoPick) {
+    let sess = &game.session;
+    let me = &sess["localPlayerCellId"];
+    let actions: Vec<&Value> = sess["actions"].as_array().into_iter().flatten().filter_map(Value::as_array).flatten().collect();
+    let Some(a) = actions.iter().find(|a| a["actorCellId"] == *me && a["type"] == "pick" && a["completed"] == false) else { return };
+    let aid = a["id"].as_i64().unwrap_or(0);
+    let current = a["championId"].as_i64().unwrap_or(0);
+    if aid == done.locked || (current != 0 && (aid, current) != done.hovered) {
+        return;
+    }
+    let team: Vec<&Value> = sess["myTeam"].as_array().into_iter().flatten().collect();
+    let pos = team.iter().find(|p| p["cellId"] == *me).and_then(|p| p["assignedPosition"].as_str()).unwrap_or("").to_uppercase();
+    let picks = LANES.iter().position(|l| *l == pos).map_or_else(|| picks.concat(), |i| picks[i].clone());
+    let taken = |id: i64| {
+        actions.iter().any(|b| b["completed"] == true && b["championId"] == id) || team.iter().any(|p| p["cellId"] != *me && p["championPickIntent"] == id)
+    };
+    let Some(champ) = picks.iter().copied().find(|id| game.pickable.contains(id) && !taken(*id)) else { return };
+    let path = format!("/lol-champ-select/v1/session/actions/{aid}");
+    if a["isInProgress"] != true {
+        if current != champ && api.send("PATCH", &path, Some(json!({ "championId": champ }))).is_ok() {
+            done.hovered = (aid, champ);
+        }
+        return;
+    }
+    if let Some(rec) = champ_rec_path(sess, s, champ).and_then(|p| api.get(&p)).and_then(|v| v.get(0).cloned()) {
+        if let [d, f] = ids(Some(rec["summonerSpellIds"].clone()))[..] {
+            // Keep Flash (or whichever) on the key the player already has it on.
+            let mine = team.iter().find(|p| p["cellId"] == *me);
+            let (d, f) = if mine.is_some_and(|p| p["spell1Id"] == f || p["spell2Id"] == d) { (f, d) } else { (d, f) };
+            let _ = api.send("PATCH", "/lol-champ-select/v1/session/my-selection", Some(json!({ "spell1Id": d, "spell2Id": f })));
+        }
+        if let Err(e) = save_runes(api, rec_page(&rec)) {
+            s.lock().unwrap().error = e;
+        }
+    }
+    if api.send("PATCH", &path, Some(json!({ "championId": champ, "completed": true }))).is_ok() {
+        done.locked = aid;
+    }
 }
 
 fn hover(s: &S, t: &Turn, id: i64) {
@@ -915,12 +1034,17 @@ struct App {
     /// Queue group tab chosen in the improved layout.
     queue_tab: Option<&'static str>,
     show_offline: bool,
+    friend_search: String,
     chat_input: String,
     /// Which layout's style is currently applied to the context.
     styled: Option<bool>,
     /// Path overrides from options; empty means auto-detect.
     league_dir: String,
     riot_client: String,
+    /// Mirrors `Shared.auto_picks` so settings can be saved while the state is locked.
+    auto_picks: Picks,
+    /// Auto pick search text per lane.
+    pick_search: [String; 5],
 }
 
 impl eframe::App for App {
@@ -970,7 +1094,17 @@ impl App {
         let lang = if i18n::pt() { "pt" } else { "en" };
         let _ = std::fs::write(
             p,
-            format!("improved_layout={}\nlang={lang}\nleague_dir={}\nriot_client={}\n", self.improved as u8, self.league_dir, self.riot_client),
+            format!(
+                "improved_layout={}\nlang={lang}\nleague_dir={}\nriot_client={}\n{}",
+                self.improved as u8,
+                self.league_dir,
+                self.riot_client,
+                LANES
+                    .iter()
+                    .zip(&self.auto_picks)
+                    .map(|(lane, ids)| format!("picks_{}={}\n", lane.to_lowercase(), ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")))
+                    .collect::<String>()
+            ),
         );
     }
 
@@ -1087,6 +1221,7 @@ impl App {
                         act(&s, "DELETE", "/lol-lobby/v2/lobby".into(), None);
                     }
                 });
+                self.auto_pick_editor(ui, &mut g);
                 ui.separator();
                 self.queue_picker(ui, &g);
             }
@@ -1206,6 +1341,48 @@ impl App {
         }
     }
 
+    /// Collapsible auto pick lists, up to 5 champions per lane in priority order.
+    fn auto_pick_editor(&mut self, ui: &mut egui::Ui, g: &mut Shared) {
+        let before = self.auto_picks.clone();
+        let title = egui::RichText::new(tr("Auto pick by lane", "Escolha automática por rota")).strong();
+        egui::CollapsingHeader::new(title).id_salt("auto_pick").show(ui, |ui| {
+            ui.label(egui::RichText::new(tr(
+                "Up to 5 per lane, in order. On your turn LoLite locks the first one still available for your assigned lane (every lane in order when the queue assigns none), with its recommended runes and spells.",
+                "Até 5 por rota, em ordem. Na sua vez o LoLite confirma o primeiro ainda disponível da sua rota (todas as rotas em ordem quando a fila não define rota), com runas e feitiços recomendados.",
+            )).weak());
+            for (i, lane) in LANES.iter().enumerate() {
+                ui.add_space(4.0);
+                // Search results show inline instead of in a popup, so they wrap with the panel instead of covering the friends list.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(i18n::role(lane)).strong());
+                    for (n, id) in before[i].iter().enumerate() {
+                        if ui.button(format!("{}. {}  ×", n + 1, champ_name(g, *id))).on_hover_text(tr("Remove", "Remover")).clicked() {
+                            self.auto_picks[i].remove(n);
+                        }
+                    }
+                    if before[i].len() < 5 {
+                        ui.add(egui::TextEdit::singleline(&mut self.pick_search[i]).hint_text(tr("+ Add champion", "+ Adicionar campeão")).desired_width(150.0));
+                    }
+                });
+                let q = self.pick_search[i].trim().to_lowercase();
+                if !q.is_empty() && before[i].len() < 5 {
+                    ui.horizontal_wrapped(|ui| {
+                        for (id, name) in base_champs(g).filter(|c| !before[i].contains(&c.0) && c.1.to_lowercase().contains(&q)).take(12) {
+                            if ui.small_button(name).clicked() {
+                                self.auto_picks[i].push(*id);
+                                self.pick_search[i].clear();
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        if self.auto_picks != before {
+            g.auto_picks = self.auto_picks.clone();
+            self.save_settings();
+        }
+    }
+
     fn champ_select(&mut self, ui: &mut egui::Ui, g: &Shared) {
         let sess = &g.session;
         let me = sess["localPlayerCellId"].as_i64();
@@ -1273,8 +1450,9 @@ impl App {
 fn main() -> eframe::Result {
     let (league_dir, riot_client) = (setting("league_dir").unwrap_or_default(), setting("riot_client").unwrap_or_default());
     riot::set_paths(&league_dir, &riot_client);
+    let auto_picks: Picks = LANES.map(|lane| setting(&format!("picks_{}", lane.to_lowercase())).unwrap_or_default().split(',').filter_map(|id| id.parse().ok()).collect());
     let (tx, rx) = std::sync::mpsc::channel();
-    let s: S = Arc::new(Mutex::new(Shared { auto_launch: true, poke: Some(tx.clone()), ..Default::default() }));
+    let s: S = Arc::new(Mutex::new(Shared { auto_launch: true, poke: Some(tx.clone()), auto_picks: auto_picks.clone(), ..Default::default() }));
     let icon = egui::IconData { rgba: include_bytes!("../assets/icon64.rgba").to_vec(), width: 64, height: 64 };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("LoLite").with_inner_size([720.0, 680.0]).with_icon(icon),
@@ -1288,6 +1466,8 @@ fn main() -> eframe::Result {
             ctx.set_fonts(fancy::fonts(false));
             let s2 = s.clone();
             std::thread::spawn(move || poller(s2, ctx, tx, rx));
+            let s3 = s.clone();
+            std::thread::spawn(move || ux_guard(s3));
             if let Some(lang) = setting("lang") {
                 i18n::set_pt(lang == "pt");
             }
@@ -1300,10 +1480,13 @@ fn main() -> eframe::Result {
                 friends_open: true,
                 queue_tab: None,
                 show_offline: false,
+                friend_search: String::new(),
                 chat_input: String::new(),
                 styled: None,
                 league_dir,
                 riot_client,
+                auto_picks,
+                pick_search: Default::default(),
             }))
         }),
     )

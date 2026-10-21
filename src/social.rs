@@ -88,8 +88,18 @@ fn fit(ui: &Ui, text: &str, size: f32, color: Color32, width: f32) -> std::sync:
     ui.painter().layout_job(job)
 }
 
-/// Clickable friend/conversation row: avatar with presence dot, name, status, unread badge.
-fn row(ui: &mut Ui, name: &str, status: &str, dot: Color32, unread: i64) -> bool {
+/// In League and free to join: not queued, in champ select or in game.
+fn invitable(f: &Value) -> bool {
+    online(f) && f["product"] == "league_of_legends" && !matches!(f["lol"]["gameStatus"].as_str(), Some("inQueue" | "championSelect" | "inGame"))
+}
+
+fn invite(s: &S, f: &Value) {
+    act(s, "POST", "/lol-lobby/v2/lobby/invitations".into(), Some(json!([{ "toSummonerId": f["summonerId"], "toPuuid": f["puuid"] }])));
+}
+
+/// Clickable friend/conversation row: avatar with presence dot, name, status, unread badge, optional invite button.
+/// Returns (row clicked, invite clicked).
+fn row(ui: &mut Ui, name: &str, status: &str, dot: Color32, unread: i64, can_invite: bool) -> (bool, bool) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click());
     let v = ui.visuals();
     if resp.hovered() {
@@ -101,7 +111,7 @@ fn row(ui: &mut Ui, name: &str, status: &str, dot: Color32, unread: i64) -> bool
     let d = pos2(c.x + 10.0, c.y + 10.0);
     ui.painter().circle_filled(d, 5.5, v.panel_fill);
     ui.painter().circle_filled(d, 4.0, dot);
-    let badge_w = if unread > 0 { 30.0 } else { 0.0 };
+    let badge_w = if unread > 0 { 30.0 } else { 0.0 } + if can_invite { 30.0 } else { 0.0 };
     let text_w = rect.width() - 46.0 - badge_w - 6.0;
     let (strong, weak) = (v.strong_text_color(), v.weak_text_color());
     let top = fit(ui, name, 14.0, strong, text_w);
@@ -113,7 +123,19 @@ fn row(ui: &mut Ui, name: &str, status: &str, dot: Color32, unread: i64) -> bool
         ui.painter().rect_filled(b, CornerRadius::same(9), BADGE);
         ui.painter().text(b.center(), Align2::CENTER_CENTER, unread.to_string(), FontId::proportional(11.0), Color32::WHITE);
     }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    // Round "+" drawn over the row; registered after it, so it takes the click.
+    let invited = can_invite && {
+        let c = pos2(if unread > 0 { rect.right() - 48.0 } else { rect.right() - 16.0 }, rect.center().y);
+        let hit = ui.interact(Rect::from_center_size(c, vec2(26.0, 26.0)), ui.id().with((name, "invite")), Sense::click());
+        let hit = hit.on_hover_text(tr("Invite to lobby", "Convidar para o saguão")).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let (fill, mark) = if hit.hovered() { (ONLINE, Color32::BLACK) } else { (ui.visuals().widgets.inactive.bg_fill, ONLINE) };
+        ui.painter().circle_filled(c, 11.0, fill);
+        for d in [vec2(5.0, 0.0), vec2(0.0, 5.0)] {
+            ui.painter().line_segment([c - d, c + d], Stroke::new(2.0, mark));
+        }
+        hit.clicked()
+    };
+    (resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked(), invited)
 }
 
 fn group_label(ui: &mut Ui, text: &str, count: usize) {
@@ -168,20 +190,25 @@ impl App {
     }
 
     fn friend_list(&mut self, ui: &mut Ui, g: &mut Shared) {
-        let mut friends: Vec<&Value> = g.friends.iter().collect();
+        ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text(tr("Search friends…", "Buscar amigos…")).desired_width(f32::INFINITY));
+        let q = self.friend_search.trim().to_lowercase();
+        let mut friends: Vec<&Value> = g.friends.iter().filter(|f| friend_name(f).to_lowercase().contains(&q)).collect();
         friends.sort_by_key(|f| (!online(f), friend_name(f).to_lowercase()));
         let total_online = friends.iter().filter(|f| online(f)).count();
+        let in_lobby = g.phase == "Lobby";
         ui.checkbox(&mut self.show_offline, tr("Show offline", "Mostrar offline"));
+        // Searching also looks through offline friends.
+        let show_offline = self.show_offline || !q.is_empty();
         let mut open = None;
         egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             // Every unread conversation, including offline friends and non-friends the list hides.
-            if !g.unread.is_empty() {
+            if !g.unread.is_empty() && q.is_empty() {
                 group_label(ui, tr("Unread", "Não lidas"), g.unread.len());
                 let mut convs: Vec<_> = g.unread.iter().collect();
                 convs.sort_by_key(|c| c.1.0.to_lowercase());
                 for (pid, (name, n)) in convs {
                     let text = if *n == 1 { tr("New message", "Nova mensagem").to_string() } else { format!("{n} {}", tr("new messages", "novas mensagens")) };
-                    if row(ui, name, &text, BADGE, *n) {
+                    if row(ui, name, &text, BADGE, *n, false).0 {
                         open = Some((pid.clone(), name.clone()));
                     }
                 }
@@ -192,7 +219,7 @@ impl App {
             }
             for (i, f) in friends.iter().enumerate() {
                 if !online(f) {
-                    if !self.show_offline {
+                    if !show_offline {
                         break;
                     }
                     if i == total_online {
@@ -202,8 +229,12 @@ impl App {
                 let pid = f["pid"].as_str().unwrap_or("").to_string();
                 let (status, color) = presence(f);
                 let unread = g.unread.get(&pid).map_or(0, |u| u.1);
-                if row(ui, &friend_name(f), &status, color, unread) {
+                let (clicked, invited) = row(ui, &friend_name(f), &status, color, unread, in_lobby && invitable(f));
+                if clicked {
                     open = Some((pid, friend_name(f)));
+                }
+                if invited {
+                    invite(&self.s, f);
                 }
             }
         });
@@ -229,6 +260,13 @@ impl App {
                     ui.label(RichText::new(status).size(12.0).color(color));
                 }
             });
+            if let Some(f) = friend.filter(|f| g.phase == "Lobby" && invitable(f)) {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(tr("Invite", "Convidar")).clicked() {
+                        invite(&self.s, f);
+                    }
+                });
+            }
         });
         if g.chat_with.is_empty() {
             return;

@@ -345,6 +345,7 @@ impl App {
             "None" => self.fancy_play(ui, g, tr("Choose a mode", "Escolha um modo")),
             "Lobby" => {
                 self.fancy_lobby(ui, g);
+                card(ui, "", |ui| self.auto_pick_editor(ui, g));
                 self.fancy_play(ui, g, tr("Change mode", "Mudar modo"));
             }
             "Matchmaking" => {
@@ -535,7 +536,7 @@ impl App {
                         for row in options.chunks(cols) {
                             ui.horizontal(|ui| {
                                 for (id, name) in row {
-                                    let tile = Button::new(RichText::new(name).size(13.0)).min_size(vec2(w, 32.0)).selected(*id == t.current);
+                                    let tile = Button::new(RichText::new(name).size(13.0)).truncate().min_size(vec2(w, 32.0)).selected(*id == t.current);
                                     if ui.add(tile).clicked() {
                                         hover(&self.s, &t, *id);
                                     }
