@@ -34,8 +34,12 @@ League reopens its own UI after games and partway through champ select; LoLite c
 ## Requirements
 
 - Windows 10/11
-- Riot Client + League installed at `D:\Riot Games\` (paths are constants in `src/riot.rs`)
+- Riot Client + League installed. Paths are detected from `C:\ProgramData\Riot Games\RiotClientInstalls.json`; set them in **Options** if detection fails.
 - A saved Riot login: log in once with **"Stay signed in"** ticked. If the session expires, LoLite shows a **Log in** button that opens the normal Riot Client login.
+
+## Download
+
+Grab `lolite.exe` from the [latest release](https://github.com/GstvBraga/lolite/releases/latest) and run it. No installer; it's a single file.
 
 ## Build
 

@@ -4,12 +4,41 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-pub const RCS_EXE: &str = r"D:\Riot Games\Riot Client\RiotClientServices.exe";
-pub const LCU_LOCKFILE: &str = r"D:\Riot Games\League of Legends\lockfile";
+/// (League folder, RiotClientServices.exe), set once at startup and when changed in options.
+static PATHS: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+/// Empty overrides fall back to what the Riot Client installer recorded, then to the default C: install.
+pub fn set_paths(league_dir: &str, riot_client: &str) {
+    let installs: Value = std::fs::read_to_string(format!(r"{}\Riot Games\RiotClientInstalls.json", std::env::var("PROGRAMDATA").unwrap_or_default()))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let league = match league_dir {
+        "" => installs["associated_client"]
+            .as_object()
+            .and_then(|m| m.keys().find(|k| k.contains("League of Legends")).cloned())
+            .unwrap_or(r"C:\Riot Games\League of Legends".into()),
+        d => d.into(),
+    };
+    let rc = match riot_client {
+        "" => installs["rc_default"].as_str().unwrap_or(r"C:\Riot Games\Riot Client\RiotClientServices.exe").into(),
+        r => r.into(),
+    };
+    *PATHS.lock().unwrap() = (league, rc);
+}
+
+pub fn paths() -> (String, String) {
+    PATHS.lock().unwrap().clone()
+}
+
+pub fn lcu_lockfile() -> String {
+    std::path::Path::new(&paths().0).join("lockfile").to_string_lossy().into()
+}
+
 const NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn rc_lockfile() -> String {
@@ -201,7 +230,7 @@ pub fn kill(images: &[&str]) {
 
 pub fn start_riot_client(headless: bool) {
     let args: &[&str] = if headless { &["--headless"] } else { &["--launch-product=league_of_legends", "--launch-patchline=live"] };
-    let _ = Command::new(RCS_EXE).args(args).spawn();
+    let _ = Command::new(paths().1).args(args).spawn();
 }
 
 pub const RIOT_ELECTRON: &str = "Riot Client.exe";

@@ -305,7 +305,7 @@ fn poller(s: S, ctx: egui::Context, tx: Sender<String>, rx: Receiver<String>) {
             let g = s.lock().unwrap();
             (g.auto_launch, g.auto_accept, g.want_ux, g.champs.is_empty() || g.queues.is_empty(), g.chat_with.clone())
         };
-        let lcu = lcu_cache.get(riot::LCU_LOCKFILE).filter(Api::alive);
+        let lcu = lcu_cache.get(&riot::lcu_lockfile()).filter(Api::alive);
         let phase = lcu.as_ref().and_then(|a| a.get("/lol-gameflow/v1/gameflow-phase")).and_then(|v| v.as_str().map(String::from));
         let mut changed = false;
 
@@ -905,13 +905,6 @@ fn setting(key: &str) -> Option<String> {
     text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(String::from))
 }
 
-fn save_settings(improved: bool) {
-    let p = settings_path();
-    let _ = std::fs::create_dir_all(p.parent().unwrap());
-    let lang = if i18n::pt() { "pt" } else { "en" };
-    let _ = std::fs::write(p, format!("improved_layout={}\nlang={lang}\n", improved as u8));
-}
-
 struct App {
     s: S,
     queue: i64,
@@ -925,6 +918,9 @@ struct App {
     chat_input: String,
     /// Which layout's style is currently applied to the context.
     styled: Option<bool>,
+    /// Path overrides from options; empty means auto-detect.
+    league_dir: String,
+    riot_client: String,
 }
 
 impl eframe::App for App {
@@ -968,10 +964,20 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn save_settings(&self) {
+        let p = settings_path();
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        let lang = if i18n::pt() { "pt" } else { "en" };
+        let _ = std::fs::write(
+            p,
+            format!("improved_layout={}\nlang={lang}\nleague_dir={}\nriot_client={}\n", self.improved as u8, self.league_dir, self.riot_client),
+        );
+    }
+
     fn options_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button(tr("⚙ Options", "⚙ Opções"), |ui| {
             if ui.checkbox(&mut self.improved, tr("Improved layout", "Layout aprimorado")).changed() {
-                save_settings(self.improved);
+                self.save_settings();
             }
             ui.checkbox(&mut self.kill_vanguard, tr("Kill Riot also stops Vanguard", "Fechar Riot também para o Vanguard"))
                 .on_hover_text(vanguard_hint());
@@ -982,13 +988,24 @@ impl App {
                 ui.selectable_value(&mut pt, true, "Português");
                 if pt != i18n::pt() {
                     i18n::set_pt(pt);
-                    save_settings(self.improved);
+                    self.save_settings();
                     // Queue names carry a translated prefix; the poller reloads them.
                     let mut g = self.s.lock().unwrap();
                     g.queues.clear();
                     poke(&g, "");
                 }
             });
+            ui.separator();
+            // Hints show the detected path; typing one overrides it, clearing goes back to auto-detect.
+            let (league, rc) = riot::paths();
+            ui.label(tr("League of Legends folder", "Pasta do League of Legends"));
+            let a = ui.add(egui::TextEdit::singleline(&mut self.league_dir).hint_text(league).desired_width(320.0));
+            ui.label("Riot Client (RiotClientServices.exe)");
+            let b = ui.add(egui::TextEdit::singleline(&mut self.riot_client).hint_text(rc).desired_width(320.0));
+            if a.lost_focus() || b.lost_focus() {
+                riot::set_paths(self.league_dir.trim(), self.riot_client.trim());
+                self.save_settings();
+            }
         });
     }
     fn kill_riot(&self, g: &mut Shared) {
@@ -1254,6 +1271,8 @@ impl App {
 }
 
 fn main() -> eframe::Result {
+    let (league_dir, riot_client) = (setting("league_dir").unwrap_or_default(), setting("riot_client").unwrap_or_default());
+    riot::set_paths(&league_dir, &riot_client);
     let (tx, rx) = std::sync::mpsc::channel();
     let s: S = Arc::new(Mutex::new(Shared { auto_launch: true, poke: Some(tx.clone()), ..Default::default() }));
     let icon = egui::IconData { rgba: include_bytes!("../assets/icon64.rgba").to_vec(), width: 64, height: 64 };
@@ -1283,6 +1302,8 @@ fn main() -> eframe::Result {
                 show_offline: false,
                 chat_input: String::new(),
                 styled: None,
+                league_dir,
+                riot_client,
             }))
         }),
     )
