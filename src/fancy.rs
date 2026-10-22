@@ -1,5 +1,5 @@
-//! "Improved layout": graphite surfaces, one accent for "you / act", Segoe UI, countdown rings.
-//! Same data and actions as the classic layout. Painter shapes only; no images or animation, so cost matches classic.
+//! The UI: graphite surfaces, one accent for "you / act", Segoe UI, countdown rings.
+//! Painter shapes only; no images or animation.
 use crate::*;
 use eframe::egui::{
     Align2, Button, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, Margin, Rect, RichText, Sense, Shape, Stroke, TextStyle, Ui,
@@ -27,13 +27,12 @@ fn bold_family() -> FontFamily {
 
 /// Segoe UI from Windows (nothing embedded in the exe); egui's fonts stay as fallback for symbols.
 /// The "bold" family always exists (egui's font without Segoe): font changes apply a frame late, so it must be bound before the first draw.
-pub fn fonts(segoe: bool) -> FontDefinitions {
+fn fonts() -> FontDefinitions {
     let mut f = FontDefinitions::default();
     let defaults = f.families[&FontFamily::Proportional].clone();
     let dir = std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into())).join("Fonts");
     let mut bold = defaults.clone();
-    let files: &[(&str, &str)] = if segoe { &[("segoe", "segoeui.ttf"), ("segoe-bold", "segoeuib.ttf")] } else { &[] };
-    for &(key, file) in files {
+    for (key, file) in [("segoe", "segoeui.ttf"), ("segoe-bold", "segoeuib.ttf")] {
         if let Ok(bytes) = std::fs::read(dir.join(file)) {
             f.font_data.insert(key.into(), Arc::new(FontData::from_owned(bytes)));
             let family = if key == "segoe" { f.families.get_mut(&FontFamily::Proportional).unwrap() } else { &mut bold };
@@ -45,7 +44,7 @@ pub fn fonts(segoe: bool) -> FontDefinitions {
 }
 
 pub fn apply_style(ctx: &egui::Context) {
-    ctx.set_fonts(fonts(true));
+    ctx.set_fonts(fonts());
     ctx.all_styles_mut(|st| {
         let mut v = egui::Visuals::dark();
         v.panel_fill = CANVAS;

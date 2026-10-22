@@ -809,7 +809,7 @@ fn pick_order(g: &Shared) -> Vec<(String, bool, bool)> {
         .collect()
 }
 
-/// Summoner spells + rune page pickers for champ select; shared by both layouts.
+/// Summoner spells + rune page pickers for champ select.
 fn loadout(ui: &mut egui::Ui, s: &S, g: &Shared) {
     let sess = &g.session;
     let me = sess["myTeam"].as_array().into_iter().flatten().find(|p| p["cellId"] == sess["localPlayerCellId"]);
@@ -1026,18 +1026,14 @@ fn setting(key: &str) -> Option<String> {
 
 struct App {
     s: S,
-    queue: i64,
     search: String,
     kill_vanguard: bool,
-    improved: bool,
     friends_open: bool,
-    /// Queue group tab chosen in the improved layout.
+    /// Queue group tab chosen in the mode picker.
     queue_tab: Option<&'static str>,
     show_offline: bool,
     friend_search: String,
     chat_input: String,
-    /// Which layout's style is currently applied to the context.
-    styled: Option<bool>,
     /// Path overrides from options; empty means auto-detect.
     league_dir: String,
     riot_client: String,
@@ -1049,16 +1045,6 @@ struct App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.styled != Some(self.improved) {
-            if self.improved {
-                fancy::apply_style(ui.ctx());
-            } else {
-                ui.ctx().all_styles_mut(|st| *st = egui::Style::default());
-                ui.ctx().set_visuals(egui::Visuals::dark());
-                ui.ctx().set_fonts(fancy::fonts(false));
-            }
-            self.styled = Some(self.improved);
-        }
         let s = self.s.clone();
         // Timers count down locally between events; only these phases need a tick.
         if matches!(s.lock().unwrap().phase.as_str(), "Matchmaking" | "ReadyCheck" | "ChampSelect") {
@@ -1079,11 +1065,7 @@ impl eframe::App for App {
                 }
             });
         }
-        if self.improved {
-            self.draw_fancy(ui);
-        } else {
-            egui::CentralPanel::default().show(ui, |ui| self.draw(ui));
-        }
+        self.draw_fancy(ui);
     }
 }
 
@@ -1095,8 +1077,7 @@ impl App {
         let _ = std::fs::write(
             p,
             format!(
-                "improved_layout={}\nlang={lang}\nleague_dir={}\nriot_client={}\n{}",
-                self.improved as u8,
+                "lang={lang}\nleague_dir={}\nriot_client={}\n{}",
                 self.league_dir,
                 self.riot_client,
                 LANES
@@ -1110,9 +1091,6 @@ impl App {
 
     fn options_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button(tr("⚙ Options", "⚙ Opções"), |ui| {
-            if ui.checkbox(&mut self.improved, tr("Improved layout", "Layout aprimorado")).changed() {
-                self.save_settings();
-            }
             ui.checkbox(&mut self.kill_vanguard, tr("Kill Riot also stops Vanguard", "Fechar Riot também para o Vanguard"))
                 .on_hover_text(vanguard_hint());
             ui.horizontal(|ui| {
@@ -1160,151 +1138,6 @@ impl App {
             riot::kill(&["RiotClientServices.exe"]);
             riot::start_riot_client(false);
         });
-    }
-
-    fn draw(&mut self, ui: &mut egui::Ui) {
-        let s = self.s.clone();
-        let mut g = s.lock().unwrap();
-
-        ui.horizontal(|ui| {
-            ui.strong(if g.summoner.is_empty() { "LoLite" } else { &g.summoner });
-            ui.label(if g.phase.is_empty() { g.status.as_str() } else { i18n::phase(&g.phase) });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.options_menu(ui));
-        });
-        ui.horizontal(|ui| {
-            if g.lcu.is_some() {
-                if ui.button(if g.want_ux { tr("Hide full client", "Ocultar cliente completo") } else { tr("Open full client", "Abrir cliente completo") }).clicked() {
-                    self.toggle_full_client(&mut g);
-                }
-            } else if !g.auto_launch && ui.button(tr("Start League", "Iniciar League")).clicked() {
-                g.auto_launch = true;
-            } else if g.need_login && ui.button(tr("Log in (opens Riot Client)", "Entrar (abre o Riot Client)")).clicked() {
-                Self::log_in();
-            }
-            if ui.button(tr("Kill Riot", "Fechar Riot")).clicked() {
-                self.kill_riot(&mut g);
-            }
-            ui.checkbox(&mut self.kill_vanguard, tr("also Vanguard", "e Vanguard")).on_hover_text(vanguard_hint());
-        });
-        if !g.error.is_empty() {
-            ui.colored_label(egui::Color32::LIGHT_RED, &g.error);
-        }
-
-        for inv in g.invites.clone() {
-            let id = inv["invitationId"].as_str().unwrap_or("").to_string();
-            ui.horizontal(|ui| {
-                let from = inv["fromSummonerName"].as_str().filter(|n| !n.is_empty()).unwrap_or(tr("friend", "amigo"));
-                let queue = queue_name(&g, inv["gameConfig"]["queueId"].as_i64().unwrap_or(0));
-                ui.strong(format!("{} {from}  {queue}", tr("Invite:", "Convite:")));
-                if ui.add_enabled(inv["canAcceptInvitation"] != false, egui::Button::new(tr("Accept", "Aceitar"))).clicked() {
-                    act(&s, "POST", format!("/lol-lobby/v2/received-invitations/{id}/accept"), None);
-                }
-                if ui.button(tr("Decline", "Recusar")).clicked() {
-                    act(&s, "POST", format!("/lol-lobby/v2/received-invitations/{id}/decline"), None);
-                }
-            });
-        }
-        ui.separator();
-
-        if g.lcu.is_none() {
-            return;
-        }
-        match g.phase.as_str() {
-            "None" => self.queue_picker(ui, &g),
-            "Lobby" => {
-                self.lobby(ui, &g);
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(g.lobby["canStartActivity"] == true, egui::Button::new(tr("Find match", "Procurar partida"))).clicked() {
-                        act(&s, "POST", "/lol-lobby/v2/lobby/matchmaking/search".into(), None);
-                    }
-                    if ui.button(tr("Leave", "Sair")).clicked() {
-                        act(&s, "DELETE", "/lol-lobby/v2/lobby".into(), None);
-                    }
-                });
-                self.auto_pick_editor(ui, &mut g);
-                ui.separator();
-                self.queue_picker(ui, &g);
-            }
-            "Matchmaking" => {
-                self.lobby(ui, &g);
-                ui.heading(format!(
-                    "{} {} ({} {})",
-                    tr("In queue", "Na fila"),
-                    mmss(queue_time(&g)),
-                    tr("est.", "est."),
-                    mmss(g.search["estimatedQueueTime"].as_f64().unwrap_or(0.0))
-                ));
-                if ui.button(tr("Cancel", "Cancelar")).clicked() {
-                    act(&s, "DELETE", "/lol-lobby/v2/lobby/matchmaking/search".into(), None);
-                }
-            }
-            "ReadyCheck" => {
-                ui.heading(tr("Match found!", "Partida encontrada!"));
-                let response = match g.ready["playerResponse"].as_str().unwrap_or("?") {
-                    "None" => tr("none yet", "nenhuma ainda"),
-                    "Accepted" => tr("Accepted", "Aceita"),
-                    "Declined" => tr("Declined", "Recusada"),
-                    r => r,
-                };
-                ui.label(format!("{} {response}", tr("Your response:", "Sua resposta:")));
-                ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(tr("ACCEPT", "ACEITAR")).min_size(egui::vec2(120.0, 40.0))).clicked() {
-                        act(&s, "POST", "/lol-matchmaking/v1/ready-check/accept".into(), None);
-                    }
-                    if ui.button(tr("Decline", "Recusar")).clicked() {
-                        act(&s, "POST", "/lol-matchmaking/v1/ready-check/decline".into(), None);
-                    }
-                });
-            }
-            "ChampSelect" => self.champ_select(ui, &g),
-            "GameStart" | "InProgress" => {
-                ui.heading(tr("In game", "Em jogo"));
-            }
-            "Reconnect" => {
-                if ui.button(tr("Reconnect", "Reconectar")).clicked() {
-                    act(&s, "POST", "/lol-gameflow/v1/reconnect".into(), None);
-                }
-            }
-            "WaitingForStats" | "PreEndOfGame" | "EndOfGame" => {
-                ui.heading(tr("Game over", "Fim de jogo"));
-                if ui.button(tr("Play again", "Jogar novamente")).clicked() {
-                    act(&s, "POST", "/lol-lobby/v2/play-again".into(), None);
-                }
-            }
-            _ => {}
-        }
-        ui.separator();
-        ui.checkbox(&mut g.auto_accept, tr("Auto-accept match", "Aceitar partida automaticamente"));
-    }
-
-    fn queue_picker(&mut self, ui: &mut egui::Ui, g: &Shared) {
-        let selected = if self.queue == 0 { tr("Pick a queue", "Escolha uma fila").into() } else { queue_name(g, self.queue) };
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("queue").width(220.0).selected_text(selected).show_ui(ui, |ui| {
-                for (id, n, _) in &g.queues {
-                    ui.selectable_value(&mut self.queue, *id, n);
-                }
-            });
-            if ui.add_enabled(self.queue != 0, egui::Button::new(tr("Create lobby", "Criar saguão"))).clicked() {
-                act(&self.s, "POST", "/lol-lobby/v2/lobby".into(), Some(json!({ "queueId": self.queue })));
-            }
-        });
-    }
-
-    fn lobby(&mut self, ui: &mut egui::Ui, g: &Shared) {
-        let l = &g.lobby;
-        ui.label(queue_name(g, l["gameConfig"]["queueId"].as_i64().unwrap_or(0)));
-        for m in l["members"].as_array().into_iter().flatten() {
-            ui.label(format!(
-                "• {}  {} {}",
-                member_name(m),
-                i18n::role(m["firstPositionPreference"].as_str().unwrap_or("")),
-                i18n::role(m["secondPositionPreference"].as_str().unwrap_or(""))
-            ));
-        }
-        if g.phase == "Lobby" && l["gameConfig"]["showPositionSelector"] == true {
-            self.role_pickers(ui, g);
-        }
     }
 
     fn role_pickers(&self, ui: &mut egui::Ui, g: &Shared) {
@@ -1383,68 +1216,6 @@ impl App {
         }
     }
 
-    fn champ_select(&mut self, ui: &mut egui::Ui, g: &Shared) {
-        let sess = &g.session;
-        let me = sess["localPlayerCellId"].as_i64();
-        let left = champ_time_left(sess) / 1000.0;
-        ui.heading(format!("{}  {}s", champ_select_phase(sess["timer"]["phase"].as_str().unwrap_or("")), left as i64));
-        let order: Vec<String> = pick_order(g).into_iter().enumerate().map(|(i, (l, _, now))| format!("{}{}. {l}", if now { "▶ " } else { "" }, i + 1)).collect();
-        if !order.is_empty() {
-            ui.label(format!("{} {}", tr("Pick order:", "Ordem de escolha:"), order.join("   ")));
-        }
-
-        for p in sess["myTeam"].as_array().into_iter().flatten() {
-            let id = p["championId"].as_i64().filter(|i| *i != 0).or(p["championPickIntent"].as_i64()).unwrap_or(0);
-            let you = if p["cellId"].as_i64() == me { tr(" (you)", " (você)") } else { "" };
-            ui.horizontal(|ui| {
-                ui.label(format!("{:8} {}{you}", i18n::role(p["assignedPosition"].as_str().unwrap_or("")), champ_name(g, id)));
-                swap_buttons(ui, &self.s, g, p["cellId"].as_i64());
-            });
-        }
-        ui.separator();
-        bench(ui, &self.s, g);
-        loadout(ui, &self.s, g);
-        let enemies = enemy_team(g);
-        if !enemies.is_empty() {
-            ui.separator();
-            ui.label(tr("Enemy team:", "Time inimigo:"));
-            for (pos, champ) in enemies {
-                ui.label(format!("{pos:8} {champ}"));
-            }
-            ui.label(format!(
-                "{} {} | {} {}",
-                tr("Bans — ours:", "Banimentos — nossos:"),
-                bans(g, true),
-                tr("theirs:", "deles:"),
-                bans(g, false)
-            ));
-        }
-        ui.separator();
-
-        let t = match my_turn(g) {
-            Ok(t) => t,
-            Err(locked) => {
-                ui.label(locked.map_or(tr("Waiting…", "Aguardando…").into(), |id| format!("{} {}", tr("Locked in:", "Confirmado:"), champ_name(g, id))));
-                return;
-            }
-        };
-        ui.horizontal(|ui| {
-            ui.label(if t.is_ban { tr("Ban:", "Banir:") } else if t.active { tr("Pick:", "Escolher:") } else { tr("Pre-pick:", "Pré-escolha:") });
-            ui.text_edit_singleline(&mut self.search);
-            let verb = if t.is_ban { tr("Ban", "Banir") } else { tr("Lock in", "Confirmar") };
-            if ui.add_enabled(t.active && t.current != 0, egui::Button::new(format!("{verb} {}", champ_name(g, t.current)))).clicked() {
-                lock_in(&self.s, &t);
-            }
-        });
-        let options = champ_options(g, &t, &self.search);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for (id, name) in options {
-                if ui.selectable_label(id == t.current, name).clicked() {
-                    hover(&self.s, &t, id);
-                }
-            }
-        });
-    }
 }
 
 fn main() -> eframe::Result {
@@ -1463,7 +1234,7 @@ fn main() -> eframe::Result {
         opts,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
-            ctx.set_fonts(fancy::fonts(false));
+            fancy::apply_style(&ctx);
             let s2 = s.clone();
             std::thread::spawn(move || poller(s2, ctx, tx, rx));
             let s3 = s.clone();
@@ -1473,16 +1244,13 @@ fn main() -> eframe::Result {
             }
             Ok(Box::new(App {
                 s,
-                queue: 0,
                 search: String::new(),
                 kill_vanguard: false,
-                improved: setting("improved_layout").as_deref() == Some("1"),
                 friends_open: true,
                 queue_tab: None,
                 show_offline: false,
                 friend_search: String::new(),
                 chat_input: String::new(),
-                styled: None,
                 league_dir,
                 riot_client,
                 auto_picks,

@@ -1,4 +1,4 @@
-//! Friends list and direct-message chat; shared by both layouts, so colors come from the active theme.
+//! Friends list and direct-message chat; colors come from the active theme.
 use crate::i18n::tr;
 use crate::*;
 use eframe::egui::{Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};

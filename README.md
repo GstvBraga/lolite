@@ -29,7 +29,6 @@ League reopens its own UI after games and partway through champ select; LoLite c
 - English and Brazilian Portuguese (**Options → Language**; defaults to your League client's language)
 - **Open full client** button for anything LoLite doesn't cover (rune editing, store)
 - **Kill Riot** button: kills all Riot/League processes, optionally Vanguard too (see below)
-- **Options → Improved layout**: themed layout with queue tiles and champion grid; off by default (classic layout)
 
 ## Requirements
 
@@ -62,9 +61,9 @@ python assets/make_icon.py
 | Path | Purpose |
 |---|---|
 | `src/riot.rs` | Lockfile parsing, local HTTP client, launching and killing Riot processes |
-| `src/main.rs` | Background poller (state + launch flow), shared actions, classic layout |
-| `src/fancy.rs` | Improved layout and its theme |
-| `src/social.rs` | Friends list and chat (both layouts) |
+| `src/main.rs` | Background poller (state + launch flow), shared actions |
+| `src/fancy.rs` | UI layout and its theme |
+| `src/social.rs` | Friends list and chat |
 | `src/i18n.rs` | English / Portuguese text helper |
 | `scripts/bench.ps1` | Startup time + RAM: `-Mode full` (official client) vs `-Mode lolite` |
 | `assets/make_icon.py` | Generates `lolite.ico` (exe) and `icon64.rgba` (window icon) |
